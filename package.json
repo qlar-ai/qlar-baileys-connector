@@ -1,0 +1,33 @@
+{
+  "name": "pusaka-connector",
+  "version": "1.0.0",
+  "description": "Pusaka WhatsApp connector — runs on user's machine, bridges Baileys to Messenger-BE via SignalR",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "build:exe": "npm run build && pkg dist/index.js --targets node20-win-x64,node20-linux-x64,node20-macos-x64 --output bin/pusaka-connector"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.7",
+    "@types/qrcode": "^1.5.6",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "pkg": "^5.8.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.0"
+  },
+  "pkg": {
+    "assets": [
+      "dist/**/*"
+    ],
+    "scripts": [
+      "dist/**/*.js"
+    ]
+  }
+}
