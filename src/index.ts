@@ -1,40 +1,27 @@
-import { connectToHub } from './hub'
 import { loadSession } from './session'
+import { startServer } from './server'
 
-function parseArgs(): { hubUrl?: string; code?: string } {
+// End users never type a hub URL — this is the production endpoint baked
+// into the shipped build. --hub / MESSENGER_BE_HUB_URL stay as internal
+// overrides for local/dev testing only.
+const DEFAULT_HUB_URL = 'https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector'
+
+function parseArgs(): { hubUrl?: string } {
   const args = process.argv.slice(2)
-  const result: { hubUrl?: string; code?: string } = {}
+  const result: { hubUrl?: string } = {}
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--hub' && args[i + 1]) result.hubUrl = args[++i]
-    if (args[i] === '--code' && args[i + 1]) result.code = args[++i]
   }
 
   return result
 }
 
-const { hubUrl: argHub, code } = parseArgs()
-
-// Hub URL: CLI arg → env var → saved session
+const { hubUrl: argHub } = parseArgs()
 const session = loadSession()
-const hubUrl = argHub ?? process.env.MESSENGER_BE_HUB_URL ?? session?.hubUrl
 
-if (!hubUrl) {
-  console.error(
-    'Error: Hub URL is required.\n' +
-    'Run with: ./connector --hub <MESSENGER_BE_HUB_URL> --code <PAIRING_CODE>\n' +
-    'Or on subsequent runs: ./connector --hub <MESSENGER_BE_HUB_URL>',
-  )
-  process.exit(1)
-}
+// Hub URL: CLI arg → env var → saved session (so a machine paired against DEV
+// keeps reconnecting to DEV) → default.
+const hubUrl = argHub ?? process.env.MESSENGER_BE_HUB_URL ?? session?.hubUrl ?? DEFAULT_HUB_URL
 
-if (!code && !session) {
-  console.error(
-    'Error: No session found and no pairing code provided.\n' +
-    'Run with: ./connector --hub <MESSENGER_BE_HUB_URL> --code <PAIRING_CODE>',
-  )
-  process.exit(1)
-}
-
-console.log(`Pusaka Connector starting — Hub: ${hubUrl}`)
-connectToHub(hubUrl, code)
+startServer(hubUrl)

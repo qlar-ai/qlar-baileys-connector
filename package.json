@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
-    "build:exe": "npm run build && pkg dist/index.js --targets node20-win-x64,node20-linux-x64,node20-macos-x64 --output bin/pusaka-connector"
+    "bundle": "tsc --noEmit && esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist-bundle/index.cjs",
+    "build:exe": "npm run bundle && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/pusaka-connector"
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",
@@ -18,16 +19,9 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "pkg": "^5.8.1",
+    "@yao-pkg/pkg": "^6.21.0",
+    "esbuild": "^0.28.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.4.0"
-  },
-  "pkg": {
-    "assets": [
-      "dist/**/*"
-    ],
-    "scripts": [
-      "dist/**/*.js"
-    ]
   }
 }

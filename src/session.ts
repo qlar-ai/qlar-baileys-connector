@@ -1,7 +1,8 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import { APP_DIR } from './appDir'
 
-const SESSION_FILE = path.join(process.cwd(), 'session.json')
+const SESSION_FILE = path.join(APP_DIR, 'session.json')
 
 export interface LocalSession {
   sessionId: string

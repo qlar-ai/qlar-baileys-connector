@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events'
 import * as signalR from '@microsoft/signalr'
 import pino from 'pino'
 import { loadSession, saveSession, clearSession, LocalSession } from './session'
@@ -8,6 +9,23 @@ const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 let localSession: LocalSession | null = null
 let waStarted = false
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+// Drives the GUI's green/red indicator and inline error banner. 'connected'
+// tracks the SignalR transport to Messenger-BE, not WhatsApp pairing itself —
+// the two can be out of sync (e.g. hub is up but the pairing code was wrong).
+export type ConnectorStatus = 'connected' | 'disconnected'
+export const hubEvents = new EventEmitter()
+
+let currentStatus: ConnectorStatus = 'disconnected'
+
+function setStatus(status: ConnectorStatus): void {
+  currentStatus = status
+  hubEvents.emit('status', status)
+}
+
+export function getStatus(): ConnectorStatus {
+  return currentStatus
+}
 
 export function connectToHub(hubUrl: string, pairingCode?: string): void {
   const connection = new signalR.HubConnectionBuilder()
@@ -23,11 +41,18 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
 
   connection.onreconnecting(() => {
     logger.info('[hub] Reconnecting to Messenger-BE…')
+    setStatus('disconnected')
   })
 
   connection.onreconnected(async () => {
     logger.info('[hub] Reconnected — re-registering session')
+    setStatus('connected')
     await reconnect(connection)
+  })
+
+  connection.onclose(() => {
+    logger.warn('[hub] Connection closed — automatic reconnect gave up')
+    setStatus('disconnected')
   })
 
   connection.on('SendMessage', async (payload: { to: string; text: string }) => {
@@ -68,10 +93,12 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     clearSession()
     localSession = null
     waStarted = false
+    hubEvents.emit('sessionCleared')
   })
 
   connection.start().then(async () => {
     logger.info('[hub] Connected to Messenger-BE at %s', hubUrl)
+    setStatus('connected')
 
     if (pairingCode) {
       await pair(connection, hubUrl, pairingCode)
@@ -80,7 +107,8 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     }
   }).catch((err) => {
     logger.error({ err }, '[hub] Failed to connect to Messenger-BE')
-    process.exit(1)
+    setStatus('disconnected')
+    hubEvents.emit('error', 'Gagal konek ke Messenger-BE — cek koneksi internet atau hub URL.')
   })
 }
 
@@ -98,15 +126,16 @@ async function pair(
     initWhatsApp(connection, result.sessionId)
   } catch (err) {
     logger.error({ err }, '[hub] Pairing failed — check the code or try a fresh code from CMS-Web')
-    process.exit(1)
+    hubEvents.emit('error', 'Pairing gagal — pairing code salah atau sudah kedaluwarsa.')
   }
 }
 
 async function reconnect(connection: signalR.HubConnection): Promise<void> {
   const session = loadSession()
   if (!session) {
-    logger.error('[hub] No session.json found — run with --code <PAIRING_CODE> first')
-    process.exit(1)
+    logger.error('[hub] No session.json found — need a pairing code first')
+    hubEvents.emit('error', 'Belum ada session tersimpan — masukkan pairing code dulu.')
+    return
   }
   localSession = session
   logger.info('[hub] Reconnecting session — SessionId: %s', session.sessionId)
@@ -115,6 +144,7 @@ async function reconnect(connection: signalR.HubConnection): Promise<void> {
     if (!waStarted) initWhatsApp(connection, session.sessionId)
   } catch (err) {
     logger.error({ err }, '[hub] Reconnect failed')
+    hubEvents.emit('error', 'Reconnect ke Messenger-BE gagal.')
   }
 }
 

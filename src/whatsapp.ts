@@ -10,8 +10,9 @@ import makeWASocket, {
 import * as fs from 'fs'
 import * as path from 'path'
 import pino from 'pino'
+import { APP_DIR } from './appDir'
 
-const WA_SESSION_DIR = path.join(process.cwd(), 'wa_session')
+const WA_SESSION_DIR = path.join(APP_DIR, 'wa_session')
 
 export interface InboundMessage {
   from: string
@@ -320,6 +321,18 @@ export async function logout(): Promise<void> {
     try { await activeSocket.logout() } catch { /* already disconnected */ }
     activeSocket = null
   }
+  if (fs.existsSync(WA_SESSION_DIR)) {
+    fs.rmSync(WA_SESSION_DIR, { recursive: true, force: true })
+  }
+}
+
+// Local "Clear Session" button — a hard reset the user can trigger even when
+// there's no live WhatsApp socket to call .logout() on (e.g. it never
+// connected, or WhatsApp already dropped it). Just ends the socket if any and
+// wipes the on-disk auth state, same end result as the manual
+// `Remove-Item wa_session` step, without hitting the WhatsApp API.
+export function resetLocalWaSession(): void {
+  stopWhatsApp()
   if (fs.existsSync(WA_SESSION_DIR)) {
     fs.rmSync(WA_SESSION_DIR, { recursive: true, force: true })
   }
