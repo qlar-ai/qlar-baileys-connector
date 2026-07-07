@@ -98,6 +98,15 @@ export function startServer(hubUrl: string): void {
       return
     }
 
+    if (req.method === 'POST' && url === '/api/shutdown') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+      logger.info('[server] Shutdown requested — exiting')
+      // Let the response flush before tearing the process down.
+      setTimeout(() => process.exit(0), 100)
+      return
+    }
+
     res.writeHead(404)
     res.end()
   }

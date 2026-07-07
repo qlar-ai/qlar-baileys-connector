@@ -6,16 +6,22 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
-    "bundle": "tsc --noEmit && esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist-bundle/index.cjs",
+    "bundle": "tsc --noEmit && node scripts/build.js",
     "build:exe": "npm run bundle && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/pusaka-connector"
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",
     "@types/qrcode": "^1.5.6",
     "@whiskeysockets/baileys": "7.0.0-rc13",
+    "abort-controller": "^3.0.0",
+    "eventsource": "^2.0.2",
+    "fetch-cookie": "^2.0.3",
+    "node-fetch": "^2.6.7",
     "pino": "^9.5.0",
     "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "tough-cookie": "^4.1.4",
+    "ws": "^7.5.10"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

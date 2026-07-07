@@ -65,7 +65,8 @@ export const INDEX_HTML = `<!doctype html>
   }
   button:disabled { background: #444 !important; color: #999 !important; cursor: not-allowed; }
   #connectBtn { background: #22c55e; color: #0a0a0a; }
-  #clearBtn { background: #2a2d35; color: #eee; }
+  #logoutBtn { background: #ef4444; color: #fff; }
+  #shutdownBtn { background: #2a2d35; color: #eee; }
 </style>
 </head>
 <body>
@@ -79,13 +80,15 @@ export const INDEX_HTML = `<!doctype html>
 
   <div>
     <button id="connectBtn">Connect</button>
-    <button id="clearBtn">Clear Session</button>
+    <button id="logoutBtn">Logout</button>
+    <button id="shutdownBtn">Shutdown</button>
   </div>
 
 <script>
   const statusEl = document.getElementById('status')
   const connectBtn = document.getElementById('connectBtn')
-  const clearBtn = document.getElementById('clearBtn')
+  const logoutBtn = document.getElementById('logoutBtn')
+  const shutdownBtn = document.getElementById('shutdownBtn')
   const codeWrap = document.getElementById('codeWrap')
   const codeInput = document.getElementById('code')
   const errorEl = document.getElementById('error')
@@ -123,10 +126,19 @@ export const INDEX_HTML = `<!doctype html>
     }
   })
 
-  clearBtn.addEventListener('click', async () => {
-    clearBtn.disabled = true
+  logoutBtn.addEventListener('click', async () => {
+    logoutBtn.disabled = true
     await fetch('/api/clear-session', { method: 'POST' })
-    clearBtn.disabled = false
+    logoutBtn.disabled = false
+  })
+
+  shutdownBtn.addEventListener('click', async () => {
+    shutdownBtn.disabled = true
+    connectBtn.disabled = true
+    logoutBtn.disabled = true
+    statusEl.textContent = 'SHUTTING DOWN'
+    statusEl.className = 'status disconnected'
+    await fetch('/api/shutdown', { method: 'POST' }).catch(() => {})
   })
 
   const events = new EventSource('/api/events')
