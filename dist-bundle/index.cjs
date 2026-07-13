@@ -166137,7 +166137,6 @@ function connectToHub(hubUrl2, pairingCode) {
   });
   connection.onreconnected(async () => {
     logger.info("[hub] Reconnected \u2014 re-registering session");
-    setStatus("connected");
     await reconnect(connection);
   });
   connection.onclose(() => {
@@ -166179,7 +166178,6 @@ function connectToHub(hubUrl2, pairingCode) {
   });
   connection.start().then(async () => {
     logger.info("[hub] Connected to Messenger-BE at %s", hubUrl2);
-    setStatus("connected");
     if (pairingCode) {
       await pair(connection, hubUrl2, pairingCode);
     } else {
@@ -166239,6 +166237,7 @@ function initWhatsApp(connection, sessionId) {
     },
     async (phoneNumber) => {
       logger.info("[wa] Connected as +%s", phoneNumber);
+      setStatus("connected");
       try {
         await connection.invoke("Connected", sessionId, phoneNumber);
       } catch (err) {
@@ -166248,6 +166247,7 @@ function initWhatsApp(connection, sessionId) {
     async (reason, shouldReconnect) => {
       logger.info("[wa] Disconnected: %s", reason);
       waStarted = false;
+      setStatus("disconnected");
       try {
         await connection.invoke("Disconnected", sessionId, reason);
       } catch {
@@ -166344,8 +166344,7 @@ var INDEX_HTML = `<!doctype html>
   }
   button:disabled { background: #444 !important; color: #999 !important; cursor: not-allowed; }
   #connectBtn { background: #22c55e; color: #0a0a0a; }
-  #logoutBtn { background: #ef4444; color: #fff; }
-  #shutdownBtn { background: #2a2d35; color: #eee; }
+  #disconnectBtn { background: #ef4444; color: #fff; display: none; }
 </style>
 </head>
 <body>
@@ -166359,15 +166358,13 @@ var INDEX_HTML = `<!doctype html>
 
   <div>
     <button id="connectBtn">Connect</button>
-    <button id="logoutBtn">Logout</button>
-    <button id="shutdownBtn">Shutdown</button>
+    <button id="disconnectBtn">Disconnect</button>
   </div>
 
 <script>
   const statusEl = document.getElementById('status')
   const connectBtn = document.getElementById('connectBtn')
-  const logoutBtn = document.getElementById('logoutBtn')
-  const shutdownBtn = document.getElementById('shutdownBtn')
+  const disconnectBtn = document.getElementById('disconnectBtn')
   const codeWrap = document.getElementById('codeWrap')
   const codeInput = document.getElementById('code')
   const errorEl = document.getElementById('error')
@@ -166376,6 +166373,8 @@ var INDEX_HTML = `<!doctype html>
     const connected = status === 'connected'
     statusEl.textContent = connected ? 'CONNECTED' : 'NOT CONNECTED'
     statusEl.className = 'status ' + (connected ? 'connected' : 'disconnected')
+    connectBtn.style.display = connected ? 'none' : 'inline-block'
+    disconnectBtn.style.display = connected ? 'inline-block' : 'none'
   }
 
   function showCodeInput(show) {
@@ -166405,19 +166404,12 @@ var INDEX_HTML = `<!doctype html>
     }
   })
 
-  logoutBtn.addEventListener('click', async () => {
-    logoutBtn.disabled = true
-    await fetch('/api/clear-session', { method: 'POST' })
-    logoutBtn.disabled = false
-  })
-
-  shutdownBtn.addEventListener('click', async () => {
-    shutdownBtn.disabled = true
+  disconnectBtn.addEventListener('click', async () => {
+    disconnectBtn.disabled = true
     connectBtn.disabled = true
-    logoutBtn.disabled = true
-    statusEl.textContent = 'SHUTTING DOWN'
+    statusEl.textContent = 'DISCONNECTING'
     statusEl.className = 'status disconnected'
-    await fetch('/api/shutdown', { method: 'POST' }).catch(() => {})
+    await fetch('/api/disconnect', { method: 'POST' }).catch(() => {})
   })
 
   const events = new EventSource('/api/events')
@@ -166509,18 +166501,13 @@ data: ${JSON.stringify({ message })}
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    if (req.method === "POST" && url === "/api/clear-session") {
+    if (req.method === "POST" && url === "/api/disconnect") {
       resetLocalWaSession();
       clearSession();
       started = false;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-    if (req.method === "POST" && url === "/api/shutdown") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-      logger2.info("[server] Shutdown requested \u2014 exiting");
+      logger2.info("[server] Disconnect requested \u2014 clearing session and exiting");
       setTimeout(() => process.exit(0), 100);
       return;
     }

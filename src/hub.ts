@@ -11,8 +11,9 @@ let waStarted = false
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 // Drives the GUI's green/red indicator and inline error banner. 'connected'
-// tracks the SignalR transport to Messenger-BE, not WhatsApp pairing itself —
-// the two can be out of sync (e.g. hub is up but the pairing code was wrong).
+// tracks actual WhatsApp pairing/connection (Baileys reporting a phone
+// number), not just the SignalR transport to Messenger-BE — the hub can be
+// up while pairing itself failed or hasn't happened yet.
 export type ConnectorStatus = 'connected' | 'disconnected'
 export const hubEvents = new EventEmitter()
 
@@ -46,7 +47,6 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
 
   connection.onreconnected(async () => {
     logger.info('[hub] Reconnected — re-registering session')
-    setStatus('connected')
     await reconnect(connection)
   })
 
@@ -98,7 +98,6 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
 
   connection.start().then(async () => {
     logger.info('[hub] Connected to Messenger-BE at %s', hubUrl)
-    setStatus('connected')
 
     if (pairingCode) {
       await pair(connection, hubUrl, pairingCode)
@@ -165,6 +164,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     },
     async (phoneNumber) => {
       logger.info('[wa] Connected as +%s', phoneNumber)
+      setStatus('connected')
       try {
         await connection.invoke('Connected', sessionId, phoneNumber)
       } catch (err) {
@@ -174,6 +174,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     async (reason, shouldReconnect) => {
       logger.info('[wa] Disconnected: %s', reason)
       waStarted = false
+      setStatus('disconnected')
       try {
         await connection.invoke('Disconnected', sessionId, reason)
       } catch { /* hub may be offline */ }
