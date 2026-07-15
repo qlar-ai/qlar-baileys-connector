@@ -1,6 +1,12 @@
 const esbuild = require('esbuild')
 const fs = require('fs')
 
+const hubUrl = process.argv[2]
+if (!hubUrl) {
+  console.error('Usage: node scripts/build.js <hub-url>')
+  process.exit(1)
+}
+
 // @microsoft/signalr resolves its Node-only deps (ws, eventsource,
 // tough-cookie, node-fetch, fetch-cookie, abort-controller) via a
 // variable-aliased require (its webpack escape hatch:
@@ -33,6 +39,7 @@ esbuild
     target: 'node22',
     format: 'cjs',
     outfile: 'dist-bundle/index.cjs',
+    define: { 'process.env.CONNECTOR_HUB_URL': JSON.stringify(hubUrl) },
     plugins: [patchSignalRDynamicRequire],
   })
   .catch(() => process.exit(1))

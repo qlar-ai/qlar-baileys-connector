@@ -1,10 +1,12 @@
 import { loadSession } from './session'
 import { startServer } from './server'
 
-// End users never type a hub URL — this is the production endpoint baked
-// into the shipped build. --hub / MESSENGER_BE_HUB_URL stay as internal
-// overrides for local/dev testing only.
-const DEFAULT_HUB_URL = 'https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector'
+// End users never type a hub URL — this is baked into the shipped build at
+// package time (see scripts/build.js's esbuild `define`, wired from the
+// bundle:dev / bundle:prod npm scripts). --hub / MESSENGER_BE_HUB_URL stay as
+// internal overrides for local/dev testing only. The literal below is only
+// the fallback for unbundled runs (`npm run dev`), where no define applies.
+const DEFAULT_HUB_URL = process.env.CONNECTOR_HUB_URL ?? 'https://api-dev.pusaka.ai/cms/hubs/connector'
 
 function parseArgs(): { hubUrl?: string } {
   const args = process.argv.slice(2)
