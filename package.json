@@ -1,13 +1,13 @@
 {
-  "name": "pusaka-connector",
+  "name": "qlar-connector",
   "version": "1.0.0",
-  "description": "Pusaka WhatsApp connector — runs on user's machine, bridges Baileys to Messenger-BE via SignalR",
+  "description": "QLAR WhatsApp connector — runs on user's machine, bridges Baileys to Messenger-BE via SignalR",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
     "bundle": "tsc --noEmit && node scripts/build.js",
-    "build:exe": "npm run bundle && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/pusaka-connector"
+    "build:exe": "npm run bundle && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/qlar-connector"
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",

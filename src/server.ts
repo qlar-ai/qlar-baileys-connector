@@ -107,7 +107,7 @@ export function startServer(hubUrl: string): void {
 
   server.listen(PORT, () => {
     const localUrl = `http://localhost:${PORT}`
-    logger.info('[server] Pusaka Connector GUI running at %s', localUrl)
+    logger.info('[server] QLAR Connector GUI running at %s', localUrl)
     openInBrowser(localUrl)
   })
 }

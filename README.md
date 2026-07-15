@@ -1,4 +1,4 @@
-# Pusaka Connector
+# QLAR Connector
 
 A small WhatsApp connector that runs **on your own machine**. It bridges WhatsApp
 (via [Baileys](https://github.com/WhiskeySockets/Baileys)) to **Messenger-BE** over a

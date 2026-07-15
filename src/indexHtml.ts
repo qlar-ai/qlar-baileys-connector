@@ -6,7 +6,7 @@ export const INDEX_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Pusaka Connector</title>
+<title>QLAR Connector</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -69,7 +69,7 @@ export const INDEX_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-  <h1>Pusaka Connector</h1>
+  <h1>QLAR Connector</h1>
   <div id="status" class="status disconnected">NOT CONNECTED</div>
 
   <div id="codeWrap">

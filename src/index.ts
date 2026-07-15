@@ -24,4 +24,13 @@ const session = loadSession()
 // keeps reconnecting to DEV) → default.
 const hubUrl = argHub ?? process.env.MESSENGER_BE_HUB_URL ?? session?.hubUrl ?? DEFAULT_HUB_URL
 
+// Local dev hubs (e.g. a developer's own `dotnet run` Messenger-BE) serve
+// HTTPS with ASP.NET Core's self-signed dev cert, which Node rejects by
+// default — every connection attempt would fail negotiation with no visible
+// reason in the GUI. Only loopback targets get the bypass; the real hub
+// always has a valid cert, so production connections stay strict.
+if (/^https:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/)/i.test(hubUrl)) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+}
+
 startServer(hubUrl)

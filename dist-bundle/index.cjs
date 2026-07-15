@@ -166285,7 +166285,7 @@ var INDEX_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Pusaka Connector</title>
+<title>QLAR Connector</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -166348,7 +166348,7 @@ var INDEX_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-  <h1>Pusaka Connector</h1>
+  <h1>QLAR Connector</h1>
   <div id="status" class="status disconnected">NOT CONNECTED</div>
 
   <div id="codeWrap">
@@ -166516,7 +166516,7 @@ data: ${JSON.stringify({ message })}
   }
   server.listen(PORT, () => {
     const localUrl = `http://localhost:${PORT}`;
-    logger2.info("[server] Pusaka Connector GUI running at %s", localUrl);
+    logger2.info("[server] QLAR Connector GUI running at %s", localUrl);
     openInBrowser(localUrl);
   });
 }
@@ -166543,6 +166543,9 @@ function parseArgs() {
 var { hubUrl: argHub } = parseArgs();
 var session = loadSession();
 var hubUrl = argHub ?? process.env.MESSENGER_BE_HUB_URL ?? session?.hubUrl ?? DEFAULT_HUB_URL;
+if (/^https:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/)/i.test(hubUrl)) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 startServer(hubUrl);
 /*! Bundled license information:
 
