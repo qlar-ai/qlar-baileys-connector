@@ -166531,7 +166531,7 @@ function readBody(req) {
 }
 
 // src/index.ts
-var DEFAULT_HUB_URL = "https://api.pusaka.ai/cms/hubs/connector";
+var DEFAULT_HUB_URL = "https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector";
 function parseArgs() {
   const args = process.argv.slice(2);
   const result = {};

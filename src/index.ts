@@ -6,7 +6,7 @@ import { startServer } from './server'
 // bundle:dev / bundle:prod npm scripts). --hub / MESSENGER_BE_HUB_URL stay as
 // internal overrides for local/dev testing only. The literal below is only
 // the fallback for unbundled runs (`npm run dev`), where no define applies.
-const DEFAULT_HUB_URL = process.env.CONNECTOR_HUB_URL ?? 'https://api-dev.pusaka.ai/cms/hubs/connector'
+const DEFAULT_HUB_URL = process.env.CONNECTOR_HUB_URL ?? 'https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector'
 
 function parseArgs(): { hubUrl?: string } {
   const args = process.argv.slice(2)

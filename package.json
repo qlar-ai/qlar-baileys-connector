@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
-    "bundle:dev": "tsc --noEmit && node scripts/build.js https://api-dev.pusaka.ai/cms/hubs/connector",
-    "bundle:prod": "tsc --noEmit && node scripts/build.js https://api.pusaka.ai/cms/hubs/connector",
+    "bundle:dev": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector",
+    "bundle:prod": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector",
     "build:exe:dev": "npm run bundle:dev && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/dev/qlar-connector",
     "build:exe:prod": "npm run bundle:prod && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/prod/qlar-connector"
   },
