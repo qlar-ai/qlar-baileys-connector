@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-bundle
+bin
+data
+session.json
+wa_session
+*.log
+.git

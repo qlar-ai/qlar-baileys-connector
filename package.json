@@ -5,6 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev:server": "ts-node-dev --respawn --transpile-only src/server/main.ts",
+    "start:server": "node dist/server/main.js",
     "build": "tsc",
     "bundle:dev": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector",
     "bundle:prod": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector",
