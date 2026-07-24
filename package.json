@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "QLAR WhatsApp connector — runs on user's machine, bridges Baileys to Messenger-BE via SignalR",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "dev:server": "ts-node-dev --respawn --transpile-only src/server/main.ts",
@@ -10,8 +13,8 @@
     "build": "tsc",
     "bundle:dev": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector",
     "bundle:prod": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector",
-    "build:exe:dev": "npm run bundle:dev && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/dev/qlar-connector",
-    "build:exe:prod": "npm run bundle:prod && pkg dist-bundle/index.cjs --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output bin/prod/qlar-connector"
+    "build:exe:dev": "npm run bundle:dev && pkg dist-bundle/index.cjs --targets node24-win-x64,node24-linux-x64,node24-macos-x64 --output bin/dev/qlar-connector",
+    "build:exe:prod": "npm run bundle:prod && pkg dist-bundle/index.cjs --targets node24-win-x64,node24-linux-x64,node24-macos-x64 --output bin/prod/qlar-connector"
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",
@@ -28,7 +31,7 @@
     "ws": "^7.5.10"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "@yao-pkg/pkg": "^6.21.0",
     "esbuild": "^0.28.1",
     "ts-node-dev": "^2.0.0",
