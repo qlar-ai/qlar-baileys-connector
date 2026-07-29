@@ -111,7 +111,18 @@ export class SessionManager {
       } catch (err) {
         // Don't leave a dead entry in the map if start() failed.
         this.sessions.delete(sessionId)
-        this.log.error({ err, sessionId }, '[manager] failed to restore session')
+
+        // "Messenger account not found" comes from the hub (HubException) when the
+        // account was deleted (e.g. via CMS). This session is permanently dead —
+        // wipe it so it stops failing restore on every boot. Any other error is
+        // treated as transient (hub blip) and kept for a retry next boot.
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('account not found')) {
+          this.wipe(sessionId)
+          this.log.warn({ sessionId }, '[manager] account gone — wiped orphaned session')
+        } else {
+          this.log.error({ err, sessionId }, '[manager] failed to restore session (will retry next boot)')
+        }
       }
     }
   }

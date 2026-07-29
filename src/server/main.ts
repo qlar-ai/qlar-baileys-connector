@@ -24,8 +24,14 @@ if (/^https:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/)/i.test(HUB_URL)) {
 async function main(): Promise<void> {
   logger.info({ hubUrl: HUB_URL, dataDir: DATA_DIR, port: PORT }, '[server] starting multi-session connector')
   const manager = new SessionManager(HUB_URL, DATA_DIR)
-  await manager.restore()
+
+  // Open the HTTP port FIRST so Azure's startup probe passes immediately. restore()
+  // reconnects every persisted session (a SignalR connection + Baileys socket each)
+  // and can take minutes; awaiting it before listening makes the platform's 230s
+  // start probe time out and kill the container in a crash loop.
   startControlServer(manager, PORT)
+
+  manager.restore().catch((err) => logger.error({ err }, '[server] session restore failed'))
 }
 
 main().catch((err) => {
