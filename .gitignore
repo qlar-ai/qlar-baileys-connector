@@ -9,6 +9,9 @@ bin/
 wa_session/
 session.json
 
+# Multi-session server per-tenant state (meta.json + wa_session per session)
+data/
+
 # Environment variables (sensitive)
 .env
 .env.*
