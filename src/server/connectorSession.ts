@@ -147,7 +147,15 @@ export class ConnectorSession {
           conn?.invoke('Disconnected', sessionId, reason).catch(() => { /* hub may be offline */ })
           if (shouldReconnect) {
             this.reconnectTimer = setTimeout(() => this.initWa(), 5000)
+            return
           }
+          // WhatsApp logged this device out (401 loggedOut). These creds are dead —
+          // reconnecting only re-triggers the logout. Tear the session down and let
+          // the manager wipe it, otherwise restore() resurrects it on every restart
+          // and the account piles up dead linked-devices until WhatsApp 401s them all.
+          this.log.warn('[wa] logged out (401) — removing and wiping session')
+          this.handlers.onClosed(sessionId)
+          void this.stop()
         },
         onMessage: (msg) => {
           conn

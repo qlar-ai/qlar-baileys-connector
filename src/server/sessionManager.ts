@@ -79,8 +79,20 @@ export class SessionManager {
     if (!fs.existsSync(this.dataRoot)) return
 
     for (const sessionId of fs.readdirSync(this.dataRoot)) {
+      // Idempotent: never open a second socket for a session already live in
+      // this process — duplicate connections for one account make WhatsApp 401.
+      if (this.sessions.has(sessionId)) continue
+
       const metaPath = path.join(this.dataRoot, sessionId, 'meta.json')
-      if (!fs.existsSync(metaPath)) continue
+      const waDir = path.join(this.dataRoot, sessionId, 'wa_session')
+
+      // A dir with no meta.json or no WhatsApp creds was never fully paired (or was
+      // half-wiped). Restoring it would spawn an unwatched QR nobody can scan — drop it.
+      if (!fs.existsSync(metaPath) || !fs.existsSync(waDir)) {
+        this.wipe(sessionId)
+        this.log.warn({ sessionId }, '[manager] incomplete session on disk — wiped, not restored')
+        continue
+      }
 
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
@@ -97,6 +109,8 @@ export class SessionManager {
         await session.start()
         this.log.info({ sessionId: meta.sessionId }, '[manager] restored session')
       } catch (err) {
+        // Don't leave a dead entry in the map if start() failed.
+        this.sessions.delete(sessionId)
         this.log.error({ err, sessionId }, '[manager] failed to restore session')
       }
     }
