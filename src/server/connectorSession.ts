@@ -196,6 +196,11 @@ export class ConnectorSession {
               messageId: msg.messageId,
               quotedMessageId: msg.quotedMessageId ?? '',
               quotedText: msg.quotedText ?? '',
+              isGroup: msg.isGroup ?? false,
+              groupName: msg.groupName ?? '',
+              senderJid: msg.senderJid ?? '',
+              senderName: msg.senderName ?? '',
+              isAddressedToBot: msg.isAddressedToBot ?? true,
             })
             .catch((err) => this.log.error({ err }, '[hub] MessageInbound failed'))
         },

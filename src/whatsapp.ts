@@ -1,7 +1,9 @@
 import makeWASocket, {
+  areJidsSameUser,
   Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  isJidGroup,
   makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
@@ -23,6 +25,19 @@ export interface InboundMessage {
   quotedMessageId?: string
   /** Text of the quoted message, so the agent can see what is being replied to. */
   quotedText?: string
+  /** True when `from` is a group rather than an individual chat. */
+  isGroup?: boolean
+  /** Group subject, when known. Empty until the metadata lookup has warmed. */
+  groupName?: string
+  /** The individual who actually sent this, which in a group is not `from`. */
+  senderJid?: string
+  /** That individual's WhatsApp display name. */
+  senderName?: string
+  /**
+   * Whether this message addresses the bot — resolved here rather than upstream because
+   * only the connector knows the bot's own JID and LID.
+   */
+  isAddressedToBot?: boolean
 }
 
 export type OnQr = (qrBase64: string) => void
@@ -98,17 +113,69 @@ function cacheQuotable(msg: WAMessage): void {
   quotableStore.set(id, msg)
 }
 
+// Group subjects, warmed in the background. A miss just means the first message from a group
+// carries no name — never worth blocking message delivery on a metadata round-trip.
+const groupSubjects = new Map<string, string>()
+
 /**
- * Pulls the reply context out of an inbound message.
- * WhatsApp hangs it off whichever content type carries the text, so each is checked.
+ * Returns the cached group subject, kicking off a lookup when it is not known yet.
+ * Deliberately non-blocking so later messages cannot overtake earlier ones.
  */
-function readQuoteContext(message: proto.IMessage): Pick<InboundMessage, 'quotedMessageId' | 'quotedText'> {
-  const contextInfo =
+function groupSubject(jid: string): string {
+  const cached = groupSubjects.get(jid)
+
+  if (cached !== undefined) return cached
+
+  // Reserve the key so concurrent messages don't each fire their own lookup.
+  groupSubjects.set(jid, '')
+
+  void activeSocket
+    ?.groupMetadata(jid)
+    .then((meta) => groupSubjects.set(jid, meta?.subject ?? ''))
+    .catch((err) => log.warn({ err, jid }, '[wa] group metadata lookup failed'))
+
+  return ''
+}
+
+/**
+ * Whether a group message actually addresses the bot.
+ *
+ * Two ways count, because both are how people really summon a bot in a group:
+ *   1. an @mention of the bot;
+ *   2. a reply to one of the bot's own messages.
+ *
+ * The bot has two identities — its phone JID and its LID — and a mention may arrive as either,
+ * so both are compared. Matching only the phone number would leave the bot deaf in every
+ * LID-migrated group.
+ */
+function isAddressedToBot(contextInfo: proto.IContextInfo | null | undefined): boolean {
+  const me = [activeSocket?.user?.id, activeSocket?.user?.lid].filter(Boolean) as string[]
+
+  if (me.length === 0) return false
+
+  const mentioned = contextInfo?.mentionedJid ?? []
+
+  if (mentioned.some((jid) => me.some((mine) => areJidsSameUser(jid, mine)))) return true
+
+  const quotedAuthor = contextInfo?.participant
+
+  return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+}
+
+/** WhatsApp hangs contextInfo off whichever content type carries the text. */
+function contextInfoOf(message: proto.IMessage): proto.IContextInfo | null | undefined {
+  return (
     message.extendedTextMessage?.contextInfo ??
     message.imageMessage?.contextInfo ??
     message.videoMessage?.contextInfo ??
     message.documentMessage?.contextInfo
+  )
+}
 
+/** Pulls the reply context out of an inbound message. */
+function readQuoteContext(
+  contextInfo: proto.IContextInfo | null | undefined,
+): Pick<InboundMessage, 'quotedMessageId' | 'quotedText'> {
   const quoted = contextInfo?.quotedMessage
 
   if (!contextInfo?.stanzaId || !quoted) return {}
@@ -234,11 +301,27 @@ export async function startWhatsApp(
       // Kept before the callback so the reply that follows can quote this exact message.
       cacheQuotable(msg)
 
+      const contextInfo = contextInfoOf(msg.message)
+      const isGroup = isJidGroup(from) ?? false
+
       log.info(
-        { from, messageId: msg.key.id, textPreview: text.slice(0, 120) },
+        { from, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
         '[in] ← inbound message forwarded to hub',
       )
-      onMessage({ from, text, messageId: msg.key.id ?? '', ...readQuoteContext(msg.message) })
+
+      onMessage({
+        from,
+        text,
+        messageId: msg.key.id ?? '',
+        ...readQuoteContext(contextInfo),
+        isGroup,
+        // In a group `from` is the group itself, so the individual comes off the key.
+        senderJid: isGroup ? (msg.key.participant ?? '') : from,
+        senderName: msg.pushName ?? '',
+        groupName: isGroup ? groupSubject(from) : '',
+        // Individual chats are always addressed to the bot; groups have to earn it.
+        isAddressedToBot: isGroup ? isAddressedToBot(contextInfo) : true,
+      })
     }
   })
 
