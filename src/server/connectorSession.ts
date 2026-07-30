@@ -64,14 +64,17 @@ export class ConnectorSession {
       .build()
     this.connection = connection
 
-    connection.on('SendMessage', async (payload: { to: string; text: string }) => {
-      if (!payload?.to || payload?.text == null) return
-      try {
-        await this.wa?.sendMessage(payload.to, payload.text)
-      } catch (err) {
-        this.log.error({ err, to: payload.to }, '[hub] send failed')
-      }
-    })
+    connection.on(
+      'SendMessage',
+      async (payload: { to: string; text: string; quotedMessageId?: string }) => {
+        if (!payload?.to || payload?.text == null) return
+        try {
+          await this.wa?.sendMessage(payload.to, payload.text, payload.quotedMessageId)
+        } catch (err) {
+          this.log.error({ err, to: payload.to }, '[hub] send failed')
+        }
+      },
+    )
 
     connection.on('GenerateQr', () => {
       this.log.info('[hub] GenerateQr — restarting Baileys')
@@ -191,6 +194,8 @@ export class ConnectorSession {
               from: msg.from,
               text: msg.text,
               messageId: msg.messageId,
+              quotedMessageId: msg.quotedMessageId ?? '',
+              quotedText: msg.quotedText ?? '',
             })
             .catch((err) => this.log.error({ err }, '[hub] MessageInbound failed'))
         },

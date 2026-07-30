@@ -58,7 +58,7 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     setStatus('disconnected')
   })
 
-  connection.on('SendMessage', async (payload: { to: string; text: string }) => {
+  connection.on('SendMessage', async (payload: { to: string; text: string; quotedMessageId?: string }) => {
     // Raw payload exactly as it arrived over SignalR from Messenger-BE.
     // If `to`/`text` are undefined here, the server↔connector property casing
     // is mismatched (server sends a single { to, text } object).
@@ -76,7 +76,7 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     }
 
     try {
-      await sendMessage(payload.to, payload.text)
+      await sendMessage(payload.to, payload.text, payload.quotedMessageId)
       logger.info({ to: payload.to }, '[hub] ✔ sendMessage() completed without throwing')
     } catch (err) {
       logger.error({ err, to: payload.to }, '[hub] ✖ Send failed')
@@ -222,6 +222,8 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
           from: msg.from,
           text: msg.text,
           messageId: msg.messageId,
+          quotedMessageId: msg.quotedMessageId ?? '',
+          quotedText: msg.quotedText ?? '',
         })
       } catch (err) {
         logger.error({ err }, '[hub] Failed to forward inbound message')

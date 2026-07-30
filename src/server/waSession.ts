@@ -5,6 +5,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
+  WAMessage,
   WASocket,
 } from '@whiskeysockets/baileys'
 import * as fs from 'fs'
@@ -15,6 +16,10 @@ export interface InboundMessage {
   from: string
   text: string
   messageId: string
+  /** Id of the message this one quotes, when the user replied to something. */
+  quotedMessageId?: string
+  /** Text of the quoted message, so the agent can see what is being replied to. */
+  quotedText?: string
 }
 
 export interface WaCallbacks {
@@ -35,6 +40,10 @@ export class WaSession {
   private phoneNumber: string | null = null
   private readonly waDir: string
   private readonly messageStore = new Map<string, proto.IMessage>()
+  // Full inbound messages kept so a later reply can quote them. Baileys needs the whole
+  // WAMessage (key + content) to build the quote, not just the content that `messageStore`
+  // holds for retry/decryption.
+  private readonly quotableStore = new Map<string, WAMessage>()
   private readonly log: Logger
   private readonly baileysLogger: Logger
 
@@ -60,6 +69,45 @@ export class WaSession {
       if (oldest !== undefined) this.messageStore.delete(oldest)
     }
     this.messageStore.set(id, message)
+  }
+
+  /** Remembers a message so a later outbound reply can quote it. */
+  private cacheQuotable(msg: WAMessage): void {
+    const id = msg.key?.id
+    if (!id) return
+
+    if (this.quotableStore.size > 500) {
+      const oldest = this.quotableStore.keys().next().value
+      if (oldest !== undefined) this.quotableStore.delete(oldest)
+    }
+
+    this.quotableStore.set(id, msg)
+  }
+
+  /**
+   * Pulls the reply context out of an inbound message.
+   * WhatsApp hangs it off whichever content type carries the text, so each is checked.
+   */
+  private static readQuoteContext(message: proto.IMessage): Pick<InboundMessage, 'quotedMessageId' | 'quotedText'> {
+    const contextInfo =
+      message.extendedTextMessage?.contextInfo ??
+      message.imageMessage?.contextInfo ??
+      message.videoMessage?.contextInfo ??
+      message.documentMessage?.contextInfo
+
+    const quoted = contextInfo?.quotedMessage
+
+    if (!contextInfo?.stanzaId || !quoted) return {}
+
+    return {
+      quotedMessageId: contextInfo.stanzaId,
+      quotedText:
+        quoted.conversation ??
+        quoted.extendedTextMessage?.text ??
+        quoted.imageMessage?.caption ??
+        quoted.videoMessage?.caption ??
+        '',
+    }
   }
 
   async start(cb: WaCallbacks): Promise<void> {
@@ -124,15 +172,38 @@ export class WaSession {
           ''
 
         if (!text || !from) continue
-        cb.onMessage({ from, text, messageId: msg.key.id ?? '' })
+
+        // Kept before the callback so the reply that follows can quote this exact message.
+        this.cacheQuotable(msg)
+
+        cb.onMessage({
+          from,
+          text,
+          messageId: msg.key.id ?? '',
+          ...WaSession.readQuoteContext(msg.message),
+        })
       }
     })
   }
 
-  async sendMessage(to: string, text: string): Promise<void> {
+  /**
+   * Sends a text message, optionally as a WhatsApp reply to an earlier message.
+   *
+   * `quotedMessageId` is resolved against the inbound cache. An id that is no longer cached
+   * (older than the last 500 messages, or lost to a restart) degrades to a normal message
+   * rather than failing the send — the reply arriving unquoted beats it not arriving.
+   */
+  async sendMessage(to: string, text: string, quotedMessageId?: string): Promise<void> {
     if (!this.socket) throw new Error('WhatsApp socket is not connected')
+
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
-    const result = await this.socket.sendMessage(jid, { text })
+    const quoted = quotedMessageId ? this.quotableStore.get(quotedMessageId) : undefined
+
+    if (quotedMessageId && !quoted) {
+      this.log.warn({ quotedMessageId }, '[wa] quoted message not in cache — sending unquoted')
+    }
+
+    const result = await this.socket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
     this.cache(result?.key?.id, result?.message)
   }
 

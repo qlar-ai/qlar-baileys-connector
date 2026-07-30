@@ -5,6 +5,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
+  WAMessage,
   WASocket,
 } from '@whiskeysockets/baileys'
 import * as fs from 'fs'
@@ -18,6 +19,10 @@ export interface InboundMessage {
   from: string
   text: string
   messageId: string
+  /** Id of the message this one quotes, when the user replied to something. */
+  quotedMessageId?: string
+  /** Text of the quoted message, so the agent can see what is being replied to. */
+  quotedText?: string
 }
 
 export type OnQr = (qrBase64: string) => void
@@ -76,6 +81,48 @@ function describeError(err: unknown): Record<string, unknown> {
 // (a recipient device that fails to decrypt asks us to re-send). Required for
 // reliable delivery; replaces Baileys' removed makeInMemoryStore.
 const messageStore = new Map<string, proto.IMessage>()
+
+// Full inbound messages kept so a later reply can quote them. Baileys needs the whole
+// WAMessage (key + content) to build the quote, not just the content `messageStore` holds.
+const quotableStore = new Map<string, WAMessage>()
+
+function cacheQuotable(msg: WAMessage): void {
+  const id = msg.key?.id
+  if (!id) return
+
+  if (quotableStore.size > 500) {
+    const oldest = quotableStore.keys().next().value
+    if (oldest !== undefined) quotableStore.delete(oldest)
+  }
+
+  quotableStore.set(id, msg)
+}
+
+/**
+ * Pulls the reply context out of an inbound message.
+ * WhatsApp hangs it off whichever content type carries the text, so each is checked.
+ */
+function readQuoteContext(message: proto.IMessage): Pick<InboundMessage, 'quotedMessageId' | 'quotedText'> {
+  const contextInfo =
+    message.extendedTextMessage?.contextInfo ??
+    message.imageMessage?.contextInfo ??
+    message.videoMessage?.contextInfo ??
+    message.documentMessage?.contextInfo
+
+  const quoted = contextInfo?.quotedMessage
+
+  if (!contextInfo?.stanzaId || !quoted) return {}
+
+  return {
+    quotedMessageId: contextInfo.stanzaId,
+    quotedText:
+      quoted.conversation ??
+      quoted.extendedTextMessage?.text ??
+      quoted.imageMessage?.caption ??
+      quoted.videoMessage?.caption ??
+      '',
+  }
+}
 function cacheMessage(id: string | null | undefined, message: proto.IMessage | null | undefined): void {
   if (!id || !message) return
   if (messageStore.size > 2000) {
@@ -184,11 +231,14 @@ export async function startWhatsApp(
 
       if (!text || !from) continue
 
+      // Kept before the callback so the reply that follows can quote this exact message.
+      cacheQuotable(msg)
+
       log.info(
         { from, messageId: msg.key.id, textPreview: text.slice(0, 120) },
         '[in] ← inbound message forwarded to hub',
       )
-      onMessage({ from, text, messageId: msg.key.id ?? '' })
+      onMessage({ from, text, messageId: msg.key.id ?? '', ...readQuoteContext(msg.message) })
     }
   })
 
@@ -228,7 +278,14 @@ export async function startWhatsApp(
   })
 }
 
-export async function sendMessage(to: string, text: string): Promise<void> {
+/**
+ * Sends a text message, optionally as a WhatsApp reply to an earlier message.
+ *
+ * `quotedMessageId` is resolved against the inbound cache. An id that is no longer cached
+ * (older than the last 500 messages, or lost to a restart) degrades to a normal message
+ * rather than failing the send — the reply arriving unquoted beats it not arriving.
+ */
+export async function sendMessage(to: string, text: string, quotedMessageId?: string): Promise<void> {
   const startedAt = Date.now()
 
   // ── STEP 1: BEFORE PAYLOAD — what we were asked to send ────────────────────
@@ -271,14 +328,20 @@ export async function sendMessage(to: string, text: string): Promise<void> {
     }
   }
 
+  const quoted = quotedMessageId ? quotableStore.get(quotedMessageId) : undefined
+
+  if (quotedMessageId && !quoted) {
+    log.warn({ quotedMessageId }, '[send] quoted message not in cache — sending unquoted')
+  }
+
   // ── STEP 3: the actual payload leaving for WhatsApp ────────────────────────
   log.debug(
-    { jid, payload: { text } },
+    { jid, payload: { text }, quotingMessageId: quotedMessageId ?? null, quoteResolved: !!quoted },
     '[send] STEP 3 — calling sock.sendMessage() (payload about to be encrypted + pushed to WhatsApp)',
   )
 
   try {
-    const result = await activeSocket.sendMessage(jid, { text })
+    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
     cacheMessage(result?.key?.id, result?.message)
     log.info(`test phil ${JSON.stringify(result)}`)
 
