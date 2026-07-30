@@ -8,6 +8,9 @@ const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
 let localSession: LocalSession | null = null
 let waStarted = false
+// The number WhatsApp is currently linked to, or null when the socket is not open. Kept so the
+// link can be re-reported to Messenger-BE without waiting on another Baileys connection event.
+let connectedPhoneNumber: string | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 // Drives the GUI's green/red indicator and inline error banner. 'connected'
@@ -140,10 +143,32 @@ async function reconnect(connection: signalR.HubConnection): Promise<void> {
   logger.info('[hub] Reconnecting session — SessionId: %s', session.sessionId)
   try {
     await connection.invoke('Reconnect', session.sessionId)
+    await announceWaState(connection)
     if (!waStarted) initWhatsApp(connection, session.sessionId)
   } catch (err) {
     logger.error({ err }, '[hub] Reconnect failed')
     hubEvents.emit('error', 'Reconnect ke Messenger-BE gagal.')
+  }
+}
+
+/**
+ * Re-report the live WhatsApp link to Messenger-BE after (re)attaching to the hub.
+ *
+ * Messenger-BE holds connector state in an in-memory registry, so every restart — i.e. every
+ * deployment — wipes IsConnected and PhoneNumber. `Reconnect` restores the ConnectionId but not
+ * those two fields: they are only ever set by `Connected`, which is sent from Baileys'
+ * connection-open event. If the WhatsApp socket itself never dropped, that event never fires
+ * again and the server would keep reporting the channel as offline indefinitely.
+ */
+async function announceWaState(connection: signalR.HubConnection): Promise<void> {
+  if (!localSession || !connectedPhoneNumber) return
+
+  try {
+    await connection.invoke('Connected', localSession.sessionId, connectedPhoneNumber)
+    setStatus('connected')
+    logger.info('[hub] Re-announced WhatsApp link (+%s) after hub reconnect', connectedPhoneNumber)
+  } catch (err) {
+    logger.error({ err }, '[hub] Re-announce of WhatsApp link failed')
   }
 }
 
@@ -164,6 +189,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     },
     async (phoneNumber) => {
       logger.info('[wa] Connected as +%s', phoneNumber)
+      connectedPhoneNumber = phoneNumber
       setStatus('connected')
       try {
         await connection.invoke('Connected', sessionId, phoneNumber)
@@ -174,6 +200,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     async (reason, shouldReconnect) => {
       logger.info('[wa] Disconnected: %s', reason)
       waStarted = false
+      connectedPhoneNumber = null
       setStatus('disconnected')
       try {
         await connection.invoke('Disconnected', sessionId, reason)

@@ -32,10 +32,20 @@ export interface WaCallbacks {
  */
 export class WaSession {
   private socket: WASocket | null = null
+  private phoneNumber: string | null = null
   private readonly waDir: string
   private readonly messageStore = new Map<string, proto.IMessage>()
   private readonly log: Logger
   private readonly baileysLogger: Logger
+
+  /**
+   * The number this session is currently linked to, or null when the socket is not open.
+   * Lets the owner re-report the link to Messenger-BE without waiting for Baileys to fire
+   * `connection.update` again — which it won't, if the WhatsApp socket never dropped.
+   */
+  get connectedPhoneNumber(): string | null {
+    return this.phoneNumber
+  }
 
   constructor(sessionDir: string, label: string) {
     this.waDir = path.join(sessionDir, 'wa_session')
@@ -83,12 +93,14 @@ export class WaSession {
 
       if (connection === 'open') {
         const phoneNumber = socket.user?.id?.split(':')[0] ?? ''
+        this.phoneNumber = phoneNumber
         this.log.info({ phoneNumber }, '[wa] connection open')
         cb.onConnected(phoneNumber)
       }
 
       if (connection === 'close') {
         this.socket = null
+        this.phoneNumber = null
         const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut
         const reason = shouldReconnect ? `disconnected (code ${statusCode})` : 'logged out'

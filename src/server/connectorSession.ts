@@ -92,6 +92,7 @@ export class ConnectorSession {
       if (!this.sessionId) return
       try {
         await connection.invoke('Reconnect', this.sessionId)
+        await this.announceWaState()
       } catch (err) {
         this.log.error({ err }, '[hub] re-register after reconnect failed')
       }
@@ -102,10 +103,35 @@ export class ConnectorSession {
     if (this.sessionId) {
       // Restored session — re-register straight away.
       await connection.invoke('Reconnect', this.sessionId)
+      await this.announceWaState()
       if (!this.waStarted) this.initWa()
     } else {
       // Fresh session — Pair with the one-time code.
       await this.pair()
+    }
+  }
+
+  /**
+   * Re-report the live WhatsApp link to Messenger-BE after (re)attaching to the hub.
+   *
+   * Messenger-BE keeps connector state in an in-memory registry, so every restart — i.e. every
+   * deployment — wipes IsConnected and PhoneNumber. SignalR reconnects and `Reconnect` restores the
+   * ConnectionId, but nothing restores those two fields: they are only ever set by `Connected`,
+   * which this connector sends from Baileys' `connection.update`. When the WhatsApp socket itself
+   * never dropped that event never fires again, so the server would keep reporting
+   * `isConnected:false` until the next WhatsApp-level reconnect — days, potentially. Announcing the
+   * state we already hold closes that window.
+   */
+  private async announceWaState(): Promise<void> {
+    const phone = this.wa?.connectedPhoneNumber
+
+    if (!this.sessionId || !phone) return
+
+    try {
+      await this.connection?.invoke('Connected', this.sessionId, phone)
+      this.log.info({ phone }, '[hub] re-announced WhatsApp link after hub reconnect')
+    } catch (err) {
+      this.log.error({ err }, '[hub] re-announce of WhatsApp link failed')
     }
   }
 
