@@ -106,11 +106,36 @@ export class ConnectorSession {
     if (this.sessionId) {
       // Restored session — re-register straight away.
       await connection.invoke('Reconnect', this.sessionId)
+      await this.declareHosted()
       await this.announceWaState()
       if (!this.waStarted) this.initWa()
     } else {
       // Fresh session — Pair with the one-time code.
       await this.pair()
+    }
+  }
+
+  /**
+   * Tell Messenger-BE this session lives on the hosted server, so it is eligible for the
+   * idle sweep that revokes abandoned pairings.
+   *
+   * Only this class calls it — `hub.ts`, the single-session connector customers run on
+   * their own machines, never does, which is what keeps self-hosted sessions out of the
+   * sweep. Sent as its own call rather than an extra argument on Pair/Reconnect so older
+   * connectors keep working: SignalR matches hub methods by name and arity, and widening
+   * either signature would break every client that has not been redeployed.
+   *
+   * Failure is not fatal. The worst case is a hosted session that goes unswept until the
+   * next reconnect re-declares it — far better than refusing to serve messages.
+   */
+  private async declareHosted(): Promise<void> {
+    if (!this.sessionId) return
+
+    try {
+      await this.connection?.invoke('DeclareHosted', this.sessionId)
+      this.log.info('[hub] declared as hosted connector session')
+    } catch (err) {
+      this.log.warn({ err }, '[hub] DeclareHosted failed — session will not be swept for idleness')
     }
   }
 
@@ -147,6 +172,7 @@ export class ConnectorSession {
     this.agentId = result.agentId
     this.log.info({ sessionId: this.sessionId }, '[hub] paired')
     this.handlers.onRegistered({ sessionId: this.sessionId, agentId: this.agentId, hubUrl: this.hubUrl })
+    await this.declareHosted()
     this.initWa()
   }
 
@@ -209,6 +235,28 @@ export class ConnectorSession {
         this.log.error({ err }, '[wa] startup error')
         this.waStarted = false
       })
+  }
+
+  /**
+   * Retire the session for good: hand WhatsApp a real logout first, then stop.
+   *
+   * `stop()` alone only closes the socket, so wiping the state directory afterwards leaves
+   * the device still listed under "Linked devices" on the user's phone — a slot burned on
+   * a session nobody can reach, and one of only four. `logout()` invalidates it upstream
+   * and removes the credentials, which is what makes the next pairing start from a QR scan
+   * as though the account had never been linked.
+   *
+   * A failed logout is swallowed: an unreachable WhatsApp must not block teardown, and the
+   * local state is wiped either way.
+   */
+  async revoke(): Promise<void> {
+    try {
+      await this.wa?.logout()
+    } catch (err) {
+      this.log.warn({ err }, '[wa] logout failed during revoke — tearing down anyway')
+    }
+
+    await this.stop()
   }
 
   async stop(): Promise<void> {

@@ -51,15 +51,23 @@ export class SessionManager {
     this.log.info({ sessionId: meta.sessionId, total: this.sessions.size }, '[manager] session registered')
   }
 
-  /** Explicitly tear down a session (DELETE /sessions/:id) and wipe its state. */
+  /**
+   * Explicitly tear down a session (DELETE /sessions/:id), revoke its WhatsApp link, and
+   * wipe its state.
+   *
+   * `revoke()` rather than `stop()` because this endpoint means "this tenant is finished",
+   * not "pause it": closing the socket without logging out leaves a linked device stranded
+   * on the customer's phone, holding one of their four slots against a session that no
+   * longer exists anywhere.
+   */
   async stop(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (session) {
-      await session.stop()
+      await session.revoke()
       this.sessions.delete(sessionId)
     }
     this.wipe(sessionId)
-    this.log.info({ sessionId, total: this.sessions.size }, '[manager] session stopped')
+    this.log.info({ sessionId, total: this.sessions.size }, '[manager] session stopped and revoked')
   }
 
   /** Hub-initiated logout — session already tore itself down, just clean up. */
