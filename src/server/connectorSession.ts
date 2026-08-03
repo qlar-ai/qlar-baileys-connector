@@ -95,6 +95,11 @@ export class ConnectorSession {
       if (!this.sessionId) return
       try {
         await connection.invoke('Reconnect', this.sessionId)
+        // Re-declared on every reconnect, not just at startup. Messenger-BE drops the
+        // session's in-memory status when the connection goes, so a transport blip would
+        // otherwise leave it reporting this channel as self-hosted — and the CMS would
+        // quietly stop showing the idle-revocation warning until the process restarted.
+        await this.declareHosted()
         await this.announceWaState()
       } catch (err) {
         this.log.error({ err }, '[hub] re-register after reconnect failed')
