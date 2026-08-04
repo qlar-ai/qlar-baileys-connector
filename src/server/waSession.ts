@@ -37,11 +37,49 @@ export interface InboundMessage {
   isAddressedToBot?: boolean
 }
 
+/**
+ * A user reacting to a message with an emoji.
+ *
+ * Reactions arrive on their own Baileys event, not as messages — they have no text, so the
+ * inbound message path drops them. Everything needed to decide whether the reaction deserves
+ * an answer is resolved here, for the same reason as `InboundMessage.isAddressedToBot`: only
+ * the connector knows the bot's own JID and LID.
+ */
+export interface InboundReaction {
+  /** The chat the reaction happened in — a group JID for groups, the user otherwise. */
+  from: string
+  /** The emoji. Empty when the user REMOVED their reaction. */
+  emoji: string
+  /** Id of the message being reacted to. */
+  targetMessageId: string
+  /**
+   * Whether the reacted-to message was sent by the bot, per WhatsApp's own key.
+   *
+   * Deliberately reported rather than trusted: upstream cross-checks it against its own
+   * record of what it sent, because a reaction to a message the bot never sent must never
+   * trigger an answer.
+   */
+  targetFromMe: boolean
+  /** Text of the reacted-to message when the connector still holds it. Often empty. */
+  targetText?: string
+  /** Who reacted. In a group this is the individual, not the group. */
+  reactorJid: string
+  /** That individual's WhatsApp display name, when known. */
+  reactorName?: string
+  /** True when `from` is a group rather than an individual chat. */
+  isGroup?: boolean
+  /** Group subject, when known. */
+  groupName?: string
+  /** True when the reaction came from the bot's own number — upstream must ignore these. */
+  isFromSelf?: boolean
+}
+
 export interface WaCallbacks {
   onQr: (qrBase64: string) => void
   onConnected: (phoneNumber: string) => void
   onDisconnected: (reason: string, shouldReconnect: boolean) => void
   onMessage: (msg: InboundMessage) => void
+  onReaction: (reaction: InboundReaction) => void
 }
 
 /**
@@ -135,6 +173,28 @@ export class WaSession {
     const quotedAuthor = contextInfo?.participant
 
     return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+  }
+
+  /** The text of a message, whichever content type happens to carry it. */
+  private static textOf(message: proto.IMessage | null | undefined): string {
+    if (!message) return ''
+
+    return (
+      message.conversation ??
+      message.extendedTextMessage?.text ??
+      message.imageMessage?.caption ??
+      message.videoMessage?.caption ??
+      ''
+    )
+  }
+
+  /** Whether a JID belongs to this session's own number (phone JID or LID). */
+  private isSelf(jid: string | null | undefined): boolean {
+    if (!jid) return false
+
+    const me = [this.socket?.user?.id, this.socket?.user?.lid].filter(Boolean) as string[]
+
+    return me.some((mine) => areJidsSameUser(jid, mine))
   }
 
   /** Remembers a message so a later outbound reply can quote it. */
@@ -266,6 +326,50 @@ export class WaSession {
         })
       }
     })
+
+    // Reactions ride their own event. They carry no text, so the handler above discards them
+    // (`if (!text) continue`) — without this subscription they are lost silently.
+    socket.ev.on('messages.reaction', (events) => {
+      for (const ev of events) {
+        const from = ev.key?.remoteJid ?? ''
+        const targetMessageId = ev.key?.id ?? ''
+
+        if (!from || !targetMessageId) continue
+
+        const isGroup = isJidGroup(from) ?? false
+        // In a group the reactor is the participant; in a DM the chat itself is the reactor.
+        const reactorJid = isGroup
+          ? (ev.reaction?.key?.participant ?? '')
+          : (ev.reaction?.key?.participant ?? ev.reaction?.key?.remoteJid ?? from)
+
+        const reaction: InboundReaction = {
+          from,
+          emoji: ev.reaction?.text ?? '',
+          targetMessageId,
+          targetFromMe: ev.key?.fromMe ?? false,
+          targetText: WaSession.textOf(this.quotableStore.get(targetMessageId)?.message),
+          reactorJid,
+          isGroup,
+          groupName: isGroup ? this.groupSubject(from) : '',
+          // Our own reactions echo back on this event. Reported rather than dropped here so
+          // upstream can log the echo instead of wondering where it went.
+          isFromSelf: (ev.reaction?.key?.fromMe ?? false) || this.isSelf(reactorJid),
+        }
+
+        this.log.info(
+          {
+            from,
+            targetMessageId,
+            targetFromMe: reaction.targetFromMe,
+            emoji: reaction.emoji || '(removal)',
+            isFromSelf: reaction.isFromSelf,
+          },
+          '[wa] ← inbound reaction',
+        )
+
+        cb.onReaction(reaction)
+      }
+    })
   }
 
   /**
@@ -275,7 +379,7 @@ export class WaSession {
    * (older than the last 500 messages, or lost to a restart) degrades to a normal message
    * rather than failing the send — the reply arriving unquoted beats it not arriving.
    */
-  async sendMessage(to: string, text: string, quotedMessageId?: string): Promise<void> {
+  async sendMessage(to: string, text: string, quotedMessageId?: string): Promise<string> {
     if (!this.socket) throw new Error('WhatsApp socket is not connected')
 
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
@@ -287,6 +391,36 @@ export class WaSession {
 
     const result = await this.socket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
     this.cache(result?.key?.id, result?.message)
+    // Our own messages go in the quotable store too, so a reaction arriving on one of them can
+    // be resolved back to its text without a round-trip.
+    if (result) this.cacheQuotable(result)
+
+    // WhatsApp's own id, which the caller reports upstream. Messenger-BE logs the message before
+    // this point and therefore only knows its own correlation id until this comes back.
+    return result?.key?.id ?? ''
+  }
+
+  /**
+   * Reacts to an earlier message with a single emoji. An empty emoji removes our reaction.
+   *
+   * Baileys needs the full message key, which only the quotable store has. A target that is no
+   * longer cached is logged and skipped rather than throwing: a reaction is decoration, and
+   * failing here would take down the answer it was meant to accompany.
+   */
+  async sendReaction(to: string, emoji: string, targetMessageId: string): Promise<void> {
+    if (!this.socket) throw new Error('WhatsApp socket is not connected')
+
+    const target = this.quotableStore.get(targetMessageId)
+
+    if (!target?.key) {
+      this.log.warn({ targetMessageId, emoji }, '[wa] reaction target not in cache — skipped')
+      return
+    }
+
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+
+    await this.socket.sendMessage(jid, { react: { text: emoji, key: target.key } })
+    this.log.info({ jid, targetMessageId, emoji }, '[wa] → reaction sent')
   }
 
   async logout(): Promise<void> {

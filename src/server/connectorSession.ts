@@ -66,12 +66,38 @@ export class ConnectorSession {
 
     connection.on(
       'SendMessage',
-      async (payload: { to: string; text: string; quotedMessageId?: string }) => {
+      async (payload: { to: string; text: string; quotedMessageId?: string; clientMessageId?: string }) => {
         if (!payload?.to || payload?.text == null) return
         try {
-          await this.wa?.sendMessage(payload.to, payload.text, payload.quotedMessageId)
+          const waMessageId = await this.wa?.sendMessage(payload.to, payload.text, payload.quotedMessageId)
+
+          // Reporting the real id back is what lets Messenger-BE recognise a reaction that later
+          // lands on this message. Best-effort: the message itself has already been delivered, so a
+          // failure here costs the ability to answer a reaction, not the answer.
+          if (payload.clientMessageId && waMessageId && this.sessionId) {
+            try {
+              await connection.invoke('MessageSent', this.sessionId, payload.clientMessageId, waMessageId)
+            } catch (err) {
+              this.log.warn({ err, waMessageId }, '[hub] MessageSent failed — reactions on this message cannot be traced')
+            }
+          }
         } catch (err) {
           this.log.error({ err, to: payload.to }, '[hub] send failed')
+        }
+      },
+    )
+
+    // Its own client method rather than a wider SendMessage signature, for the same reason
+    // DeclareHosted is separate: SignalR matches by name and arity, and a connector that has
+    // not been redeployed must keep working. Older connectors simply never receive this.
+    connection.on(
+      'SendReaction',
+      async (payload: { to: string; emoji: string; targetMessageId: string }) => {
+        if (!payload?.to || !payload?.targetMessageId) return
+        try {
+          await this.wa?.sendReaction(payload.to, payload.emoji ?? '', payload.targetMessageId)
+        } catch (err) {
+          this.log.error({ err, to: payload.to }, '[hub] send reaction failed')
         }
       },
     )
@@ -234,6 +260,24 @@ export class ConnectorSession {
               isAddressedToBot: msg.isAddressedToBot ?? true,
             })
             .catch((err) => this.log.error({ err }, '[hub] MessageInbound failed'))
+        },
+        onReaction: (reaction) => {
+          conn
+            ?.invoke('ReactionInbound', {
+              sessionId,
+              agentId: this.agentId,
+              from: reaction.from,
+              emoji: reaction.emoji,
+              targetMessageId: reaction.targetMessageId,
+              targetFromMe: reaction.targetFromMe,
+              targetText: reaction.targetText ?? '',
+              reactorJid: reaction.reactorJid,
+              reactorName: reaction.reactorName ?? '',
+              isGroup: reaction.isGroup ?? false,
+              groupName: reaction.groupName ?? '',
+              isFromSelf: reaction.isFromSelf ?? false,
+            })
+            .catch((err) => this.log.error({ err }, '[hub] ReactionInbound failed'))
         },
       })
       .catch((err) => {
