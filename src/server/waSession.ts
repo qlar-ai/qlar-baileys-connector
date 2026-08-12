@@ -16,6 +16,16 @@ import pino, { Logger } from 'pino'
 
 export interface InboundMessage {
   from: string
+  /**
+   * The same contact's other address, when WhatsApp supplies one — the phone JID for a
+   * LID-migrated contact, since `from` is then `<id>@lid`.
+   *
+   * Load-bearing rather than diagnostic: an operator blacklists or whitelists a phone number,
+   * because nobody knows their own contacts' LIDs, and without this the rule is stored against
+   * an address no inbound message ever arrives under. Empty means WhatsApp told us nothing —
+   * which is *unknown*, never "this contact has no number".
+   */
+  fromAlt?: string
   text: string
   messageId: string
   /** Id of the message this one quotes, when the user replied to something. */
@@ -297,6 +307,10 @@ export class WaSession {
         if (!msg.message || msg.key.fromMe) continue
 
         const from = msg.key.remoteJid ?? ''
+
+        // Baileys fills this from the stanza's addressing context, so for a LID-migrated contact
+        // the phone number is right here — see Utils/decode-wa-message.
+        const fromAlt = msg.key.remoteJidAlt ?? ''
         const text =
           msg.message.conversation ??
           msg.message.extendedTextMessage?.text ??
@@ -311,8 +325,14 @@ export class WaSession {
         const contextInfo = WaSession.contextInfoOf(msg.message)
         const isGroup = isJidGroup(from) ?? false
 
+        this.log.info(
+          { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
+          '[in] ← inbound message forwarded to hub',
+        )
+
         cb.onMessage({
           from,
+          fromAlt,
           text,
           messageId: msg.key.id ?? '',
           ...WaSession.readQuoteContext(contextInfo),
@@ -421,6 +441,51 @@ export class WaSession {
 
     await this.socket.sendMessage(jid, { react: { text: emoji, key: target.key } })
     this.log.info({ jid, targetMessageId, emoji }, '[wa] → reaction sent')
+  }
+
+  /**
+   * Finds the LID a phone number answers to, asking WhatsApp when we have not seen it before.
+   *
+   * This direction, and not the other one, because Baileys' mapping store is asymmetric:
+   * `getLIDsForPNs` falls through to a USync query against WhatsApp, while `getPNsForLIDs`
+   * reads the local store and stops there. So a LID cannot be turned into a number on demand,
+   * but a number can — and a number is the only thing an operator can type.
+   *
+   * Returns null when it cannot be resolved. That is not an error: the number may not be on
+   * WhatsApp, or may never have been migrated to a LID, and both mean "nothing to link".
+   */
+  async resolveLid(pn: string): Promise<string | null> {
+    if (!this.socket) {
+      this.log.warn({ pn }, '[lid] ✖ Cannot resolve — WhatsApp socket is not connected')
+      return null
+    }
+
+    const jid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`
+
+    if (jid.endsWith('@lid') || jid.endsWith('@g.us')) {
+      this.log.debug({ pn }, '[lid] Nothing to resolve — already a LID or a group')
+      return null
+    }
+
+    try {
+      const raw = await (this.socket as any).signalRepository?.lidMapping?.getLIDForPN(jid)
+
+      // Baileys hands back a device-scoped address (`<id>:3@lid`) whenever the number it was
+      // given carried a device. A 1:1 chat's `remoteJid` never does, so the bare form is the one
+      // a contact rule has to be stored under — the suffixed one would never match.
+      const lid = typeof raw === 'string' ? raw.replace(/:\d+@lid$/, '@lid') : null
+
+      // Logged either way, and at info: this is the one line that says whether WhatsApp will
+      // hand over the pairing for a given number, and the contact rules stand or fall on it.
+      this.log.info({ pn: jid, raw: raw ?? null, lid }, lid
+        ? '[lid] ✔ Resolved phone number to LID'
+        : '[lid] — WhatsApp returned no LID for this number')
+
+      return lid
+    } catch (err) {
+      this.log.error({ err, pn: jid }, '[lid] ✖ LID lookup threw')
+      return null
+    }
   }
 
   async logout(): Promise<void> {

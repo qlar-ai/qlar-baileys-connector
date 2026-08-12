@@ -102,6 +102,36 @@ export class ConnectorSession {
       },
     )
 
+    /*
+      Messenger-BE asking which LID a phone number answers to.
+
+      A command down and a separate invoke back up, rather than a SignalR client result, because
+      a connector that predates this simply never registers the handler — the server's push lands
+      nowhere and the contact rules behave exactly as they did before. A client result would
+      leave the server awaiting an answer that is never coming.
+    */
+    connection.on('ResolveLid', async (payload: { pn?: string }) => {
+      const pn = payload?.pn
+      const sessionId = this.sessionId
+
+      if (!pn || !sessionId) {
+        this.log.warn({ rawPayload: payload }, '[hub] ✖ ResolveLid payload missing "pn" — ignoring')
+        return
+      }
+
+      this.log.info({ pn }, '[hub] ◀ ResolveLid command received from Messenger-BE')
+
+      const lid = (await this.wa?.resolveLid(pn)) ?? null
+
+      // Reported even when nothing was found, so the server can stop asking about a number
+      // WhatsApp will not pair — silence here would have it retry on every list load forever.
+      try {
+        await connection.invoke('LidResolved', sessionId, pn, lid ?? '')
+      } catch (err) {
+        this.log.error({ err, pn }, '[hub] ✖ Failed to report the LID lookup result')
+      }
+    })
+
     connection.on('GenerateQr', () => {
       this.log.info('[hub] GenerateQr — restarting Baileys')
       this.wa?.stop()
@@ -249,6 +279,10 @@ export class ConnectorSession {
               sessionId,
               agentId: this.agentId,
               from: msg.from,
+              // A new field on an existing payload, which SignalR resolves by method name and
+              // arity — a connector predating this simply omits it, and the server reads the
+              // absence as "no second address known" rather than as a contradiction.
+              fromAlt: msg.fromAlt ?? '',
               text: msg.text,
               messageId: msg.messageId,
               quotedMessageId: msg.quotedMessageId ?? '',
