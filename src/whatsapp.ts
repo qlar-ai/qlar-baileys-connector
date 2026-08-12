@@ -477,6 +477,52 @@ export async function sendMessage(to: string, text: string, quotedMessageId?: st
   }
 }
 
+/**
+ * Finds the LID a phone number answers to, asking WhatsApp when we have not seen it before.
+ *
+ * This direction, and not the other one, because Baileys' mapping store is asymmetric:
+ * `getLIDsForPNs` falls through to a USync query against WhatsApp, while `getPNsForLIDs`
+ * reads the local store and stops there. So a LID cannot be turned into a number on demand,
+ * but a number can always be turned into a LID — which is the one an operator can type.
+ *
+ * Returns null when it cannot be resolved. That is not an error: the number may not be on
+ * WhatsApp, or may never have been migrated to a LID at all, and both mean "nothing to link"
+ * rather than "something went wrong".
+ */
+export async function resolveLid(pn: string): Promise<string | null> {
+  if (!activeSocket) {
+    log.warn({ pn }, '[lid] ✖ Cannot resolve — WhatsApp socket is not connected')
+    return null
+  }
+
+  const jid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`
+
+  if (jid.endsWith('@lid') || jid.endsWith('@g.us')) {
+    log.debug({ pn }, '[lid] Nothing to resolve — already a LID or a group')
+    return null
+  }
+
+  try {
+    const raw = await (activeSocket as any).signalRepository?.lidMapping?.getLIDForPN(jid)
+
+    // Baileys hands back a device-scoped address (`<id>:3@lid`) whenever the number it was given
+    // carried a device. A 1:1 chat's `remoteJid` never does, so the bare form is the one a contact
+    // rule has to be stored under — the suffixed one would be a string that never matches.
+    const lid = typeof raw === 'string' ? raw.replace(/:\d+@lid$/, '@lid') : null
+
+    // Logged either way, and at info: this is the one line that says whether WhatsApp will
+    // hand over the pairing for a given number, and the contact rules stand or fall on it.
+    log.info({ pn: jid, raw: raw ?? null, lid }, lid
+      ? '[lid] ✔ Resolved phone number to LID'
+      : '[lid] — WhatsApp returned no LID for this number')
+
+    return lid
+  } catch (err) {
+    log.error({ err, pn: jid }, '[lid] ✖ LID lookup threw')
+    return null
+  }
+}
+
 export async function logout(): Promise<void> {
   if (activeSocket) {
     try { await activeSocket.logout() } catch { /* already disconnected */ }

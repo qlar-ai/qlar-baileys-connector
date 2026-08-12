@@ -2,7 +2,7 @@ import { EventEmitter } from 'events'
 import * as signalR from '@microsoft/signalr'
 import pino from 'pino'
 import { loadSession, saveSession, clearSession, LocalSession } from './session'
-import { startWhatsApp, sendMessage, logout, stopWhatsApp } from './whatsapp'
+import { startWhatsApp, sendMessage, logout, stopWhatsApp, resolveLid } from './whatsapp'
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -80,6 +80,35 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
       logger.info({ to: payload.to }, '[hub] ✔ sendMessage() completed without throwing')
     } catch (err) {
       logger.error({ err, to: payload.to }, '[hub] ✖ Send failed')
+    }
+  })
+
+  /*
+    Messenger-BE asking which LID a phone number answers to.
+
+    A command down and a separate invoke back up, rather than a SignalR client result, because
+    a connector that predates this simply never registers the handler — the server's push
+    lands nowhere and the contact rules behave exactly as they did before. A client result
+    would leave the server awaiting an answer that is never coming.
+  */
+  connection.on('ResolveLid', async (payload: { pn?: string }) => {
+    const pn = payload?.pn
+
+    if (!pn || !localSession) {
+      logger.warn({ rawPayload: payload }, '[hub] ✖ ResolveLid payload missing "pn" — ignoring')
+      return
+    }
+
+    logger.info({ pn }, '[hub] ◀ ResolveLid command received from Messenger-BE')
+
+    const lid = await resolveLid(pn)
+
+    // Reported even when nothing was found, so the server can stop asking about a number
+    // WhatsApp will not pair — silence here would have it retry on every list load forever.
+    try {
+      await connection.invoke('LidResolved', localSession.sessionId, pn, lid ?? '')
+    } catch (err) {
+      logger.error({ err, pn }, '[hub] ✖ Failed to report the LID lookup result')
     }
   })
 
