@@ -220,6 +220,10 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
           sessionId,
           agentId: localSession?.agentId ?? '',
           from: msg.from,
+          // A new field on an existing payload, which SignalR resolves by method name and
+          // arity — a connector that predates this simply omits it, and the server reads the
+          // absence as "no second address known" rather than as a contradiction.
+          fromAlt: msg.fromAlt ?? '',
           text: msg.text,
           messageId: msg.messageId,
           quotedMessageId: msg.quotedMessageId ?? '',

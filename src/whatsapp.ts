@@ -19,6 +19,16 @@ const WA_SESSION_DIR = path.join(APP_DIR, 'wa_session')
 
 export interface InboundMessage {
   from: string
+  /**
+   * The same contact's other address, when WhatsApp supplies one — the phone JID for a
+   * LID-migrated contact, since `from` is then `<id>@lid`.
+   *
+   * Load-bearing rather than diagnostic: an operator blacklists or whitelists a phone
+   * number, because nobody knows their own contacts' LIDs, and without this the rule is
+   * stored against an address no inbound message ever arrives under. Empty means WhatsApp
+   * told us nothing — which is *unknown*, never "this contact has no number".
+   */
+  fromAlt?: string
   text: string
   messageId: string
   /** Id of the message this one quotes, when the user replied to something. */
@@ -290,6 +300,10 @@ export async function startWhatsApp(
       if (!msg.message || msg.key.fromMe) continue
 
       const from = msg.key.remoteJid ?? ''
+
+      // Baileys fills this from the stanza's addressing context, so for a LID-migrated
+      // contact the phone number is right here — see Utils/decode-wa-message.
+      const fromAlt = msg.key.remoteJidAlt ?? ''
       const text =
         msg.message.conversation ??
         msg.message.extendedTextMessage?.text ??
@@ -305,12 +319,13 @@ export async function startWhatsApp(
       const isGroup = isJidGroup(from) ?? false
 
       log.info(
-        { from, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
+        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
         '[in] ← inbound message forwarded to hub',
       )
 
       onMessage({
         from,
+        fromAlt,
         text,
         messageId: msg.key.id ?? '',
         ...readQuoteContext(contextInfo),
