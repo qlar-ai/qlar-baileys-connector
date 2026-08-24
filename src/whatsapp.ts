@@ -1,10 +1,13 @@
 import makeWASocket, {
+  areJidsSameUser,
   Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  isJidGroup,
   makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
+  WAMessage,
   WASocket,
 } from '@whiskeysockets/baileys'
 import * as fs from 'fs'
@@ -16,8 +19,35 @@ const WA_SESSION_DIR = path.join(APP_DIR, 'wa_session')
 
 export interface InboundMessage {
   from: string
+  /**
+   * The same contact's other address, when WhatsApp supplies one — the phone JID for a
+   * LID-migrated contact, since `from` is then `<id>@lid`.
+   *
+   * Load-bearing rather than diagnostic: an operator blacklists or whitelists a phone
+   * number, because nobody knows their own contacts' LIDs, and without this the rule is
+   * stored against an address no inbound message ever arrives under. Empty means WhatsApp
+   * told us nothing — which is *unknown*, never "this contact has no number".
+   */
+  fromAlt?: string
   text: string
   messageId: string
+  /** Id of the message this one quotes, when the user replied to something. */
+  quotedMessageId?: string
+  /** Text of the quoted message, so the agent can see what is being replied to. */
+  quotedText?: string
+  /** True when `from` is a group rather than an individual chat. */
+  isGroup?: boolean
+  /** Group subject, when known. Empty until the metadata lookup has warmed. */
+  groupName?: string
+  /** The individual who actually sent this, which in a group is not `from`. */
+  senderJid?: string
+  /** That individual's WhatsApp display name. */
+  senderName?: string
+  /**
+   * Whether this message addresses the bot — resolved here rather than upstream because
+   * only the connector knows the bot's own JID and LID.
+   */
+  isAddressedToBot?: boolean
 }
 
 export type OnQr = (qrBase64: string) => void
@@ -76,6 +106,100 @@ function describeError(err: unknown): Record<string, unknown> {
 // (a recipient device that fails to decrypt asks us to re-send). Required for
 // reliable delivery; replaces Baileys' removed makeInMemoryStore.
 const messageStore = new Map<string, proto.IMessage>()
+
+// Full inbound messages kept so a later reply can quote them. Baileys needs the whole
+// WAMessage (key + content) to build the quote, not just the content `messageStore` holds.
+const quotableStore = new Map<string, WAMessage>()
+
+function cacheQuotable(msg: WAMessage): void {
+  const id = msg.key?.id
+  if (!id) return
+
+  if (quotableStore.size > 500) {
+    const oldest = quotableStore.keys().next().value
+    if (oldest !== undefined) quotableStore.delete(oldest)
+  }
+
+  quotableStore.set(id, msg)
+}
+
+// Group subjects, warmed in the background. A miss just means the first message from a group
+// carries no name — never worth blocking message delivery on a metadata round-trip.
+const groupSubjects = new Map<string, string>()
+
+/**
+ * Returns the cached group subject, kicking off a lookup when it is not known yet.
+ * Deliberately non-blocking so later messages cannot overtake earlier ones.
+ */
+function groupSubject(jid: string): string {
+  const cached = groupSubjects.get(jid)
+
+  if (cached !== undefined) return cached
+
+  // Reserve the key so concurrent messages don't each fire their own lookup.
+  groupSubjects.set(jid, '')
+
+  void activeSocket
+    ?.groupMetadata(jid)
+    .then((meta) => groupSubjects.set(jid, meta?.subject ?? ''))
+    .catch((err) => log.warn({ err, jid }, '[wa] group metadata lookup failed'))
+
+  return ''
+}
+
+/**
+ * Whether a group message actually addresses the bot.
+ *
+ * Two ways count, because both are how people really summon a bot in a group:
+ *   1. an @mention of the bot;
+ *   2. a reply to one of the bot's own messages.
+ *
+ * The bot has two identities — its phone JID and its LID — and a mention may arrive as either,
+ * so both are compared. Matching only the phone number would leave the bot deaf in every
+ * LID-migrated group.
+ */
+function isAddressedToBot(contextInfo: proto.IContextInfo | null | undefined): boolean {
+  const me = [activeSocket?.user?.id, activeSocket?.user?.lid].filter(Boolean) as string[]
+
+  if (me.length === 0) return false
+
+  const mentioned = contextInfo?.mentionedJid ?? []
+
+  if (mentioned.some((jid) => me.some((mine) => areJidsSameUser(jid, mine)))) return true
+
+  const quotedAuthor = contextInfo?.participant
+
+  return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+}
+
+/** WhatsApp hangs contextInfo off whichever content type carries the text. */
+function contextInfoOf(message: proto.IMessage): proto.IContextInfo | null | undefined {
+  return (
+    message.extendedTextMessage?.contextInfo ??
+    message.imageMessage?.contextInfo ??
+    message.videoMessage?.contextInfo ??
+    message.documentMessage?.contextInfo
+  )
+}
+
+/** Pulls the reply context out of an inbound message. */
+function readQuoteContext(
+  contextInfo: proto.IContextInfo | null | undefined,
+): Pick<InboundMessage, 'quotedMessageId' | 'quotedText'> {
+  const quoted = contextInfo?.quotedMessage
+
+  if (!contextInfo?.stanzaId || !quoted) return {}
+
+  return {
+    quotedMessageId: contextInfo.stanzaId,
+    quotedText:
+      quoted.conversation ??
+      quoted.extendedTextMessage?.text ??
+      quoted.imageMessage?.caption ??
+      quoted.videoMessage?.caption ??
+      '',
+  }
+}
 function cacheMessage(id: string | null | undefined, message: proto.IMessage | null | undefined): void {
   if (!id || !message) return
   if (messageStore.size > 2000) {
@@ -176,6 +300,10 @@ export async function startWhatsApp(
       if (!msg.message || msg.key.fromMe) continue
 
       const from = msg.key.remoteJid ?? ''
+
+      // Baileys fills this from the stanza's addressing context, so for a LID-migrated
+      // contact the phone number is right here — see Utils/decode-wa-message.
+      const fromAlt = msg.key.remoteJidAlt ?? ''
       const text =
         msg.message.conversation ??
         msg.message.extendedTextMessage?.text ??
@@ -184,11 +312,31 @@ export async function startWhatsApp(
 
       if (!text || !from) continue
 
+      // Kept before the callback so the reply that follows can quote this exact message.
+      cacheQuotable(msg)
+
+      const contextInfo = contextInfoOf(msg.message)
+      const isGroup = isJidGroup(from) ?? false
+
       log.info(
-        { from, messageId: msg.key.id, textPreview: text.slice(0, 120) },
+        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
         '[in] ← inbound message forwarded to hub',
       )
-      onMessage({ from, text, messageId: msg.key.id ?? '' })
+
+      onMessage({
+        from,
+        fromAlt,
+        text,
+        messageId: msg.key.id ?? '',
+        ...readQuoteContext(contextInfo),
+        isGroup,
+        // In a group `from` is the group itself, so the individual comes off the key.
+        senderJid: isGroup ? (msg.key.participant ?? '') : from,
+        senderName: msg.pushName ?? '',
+        groupName: isGroup ? groupSubject(from) : '',
+        // Individual chats are always addressed to the bot; groups have to earn it.
+        isAddressedToBot: isGroup ? isAddressedToBot(contextInfo) : true,
+      })
     }
   })
 
@@ -228,7 +376,14 @@ export async function startWhatsApp(
   })
 }
 
-export async function sendMessage(to: string, text: string): Promise<void> {
+/**
+ * Sends a text message, optionally as a WhatsApp reply to an earlier message.
+ *
+ * `quotedMessageId` is resolved against the inbound cache. An id that is no longer cached
+ * (older than the last 500 messages, or lost to a restart) degrades to a normal message
+ * rather than failing the send — the reply arriving unquoted beats it not arriving.
+ */
+export async function sendMessage(to: string, text: string, quotedMessageId?: string): Promise<void> {
   const startedAt = Date.now()
 
   // ── STEP 1: BEFORE PAYLOAD — what we were asked to send ────────────────────
@@ -271,14 +426,20 @@ export async function sendMessage(to: string, text: string): Promise<void> {
     }
   }
 
+  const quoted = quotedMessageId ? quotableStore.get(quotedMessageId) : undefined
+
+  if (quotedMessageId && !quoted) {
+    log.warn({ quotedMessageId }, '[send] quoted message not in cache — sending unquoted')
+  }
+
   // ── STEP 3: the actual payload leaving for WhatsApp ────────────────────────
   log.debug(
-    { jid, payload: { text } },
+    { jid, payload: { text }, quotingMessageId: quotedMessageId ?? null, quoteResolved: !!quoted },
     '[send] STEP 3 — calling sock.sendMessage() (payload about to be encrypted + pushed to WhatsApp)',
   )
 
   try {
-    const result = await activeSocket.sendMessage(jid, { text })
+    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
     cacheMessage(result?.key?.id, result?.message)
     log.info(`test phil ${JSON.stringify(result)}`)
 
@@ -313,6 +474,52 @@ export async function sendMessage(to: string, text: string): Promise<void> {
       '[send] ✖ STEP 4 — sock.sendMessage() THREW (failed to push payload to WhatsApp)',
     )
     throw err
+  }
+}
+
+/**
+ * Finds the LID a phone number answers to, asking WhatsApp when we have not seen it before.
+ *
+ * This direction, and not the other one, because Baileys' mapping store is asymmetric:
+ * `getLIDsForPNs` falls through to a USync query against WhatsApp, while `getPNsForLIDs`
+ * reads the local store and stops there. So a LID cannot be turned into a number on demand,
+ * but a number can always be turned into a LID — which is the one an operator can type.
+ *
+ * Returns null when it cannot be resolved. That is not an error: the number may not be on
+ * WhatsApp, or may never have been migrated to a LID at all, and both mean "nothing to link"
+ * rather than "something went wrong".
+ */
+export async function resolveLid(pn: string): Promise<string | null> {
+  if (!activeSocket) {
+    log.warn({ pn }, '[lid] ✖ Cannot resolve — WhatsApp socket is not connected')
+    return null
+  }
+
+  const jid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`
+
+  if (jid.endsWith('@lid') || jid.endsWith('@g.us')) {
+    log.debug({ pn }, '[lid] Nothing to resolve — already a LID or a group')
+    return null
+  }
+
+  try {
+    const raw = await (activeSocket as any).signalRepository?.lidMapping?.getLIDForPN(jid)
+
+    // Baileys hands back a device-scoped address (`<id>:3@lid`) whenever the number it was given
+    // carried a device. A 1:1 chat's `remoteJid` never does, so the bare form is the one a contact
+    // rule has to be stored under — the suffixed one would be a string that never matches.
+    const lid = typeof raw === 'string' ? raw.replace(/:\d+@lid$/, '@lid') : null
+
+    // Logged either way, and at info: this is the one line that says whether WhatsApp will
+    // hand over the pairing for a given number, and the contact rules stand or fall on it.
+    log.info({ pn: jid, raw: raw ?? null, lid }, lid
+      ? '[lid] ✔ Resolved phone number to LID'
+      : '[lid] — WhatsApp returned no LID for this number')
+
+    return lid
+  } catch (err) {
+    log.error({ err, pn: jid }, '[lid] ✖ LID lookup threw')
+    return null
   }
 }
 

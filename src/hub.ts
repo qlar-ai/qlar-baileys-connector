@@ -2,12 +2,15 @@ import { EventEmitter } from 'events'
 import * as signalR from '@microsoft/signalr'
 import pino from 'pino'
 import { loadSession, saveSession, clearSession, LocalSession } from './session'
-import { startWhatsApp, sendMessage, logout, stopWhatsApp } from './whatsapp'
+import { startWhatsApp, sendMessage, logout, stopWhatsApp, resolveLid } from './whatsapp'
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
 let localSession: LocalSession | null = null
 let waStarted = false
+// The number WhatsApp is currently linked to, or null when the socket is not open. Kept so the
+// link can be re-reported to Messenger-BE without waiting on another Baileys connection event.
+let connectedPhoneNumber: string | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 // Drives the GUI's green/red indicator and inline error banner. 'connected'
@@ -55,7 +58,7 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     setStatus('disconnected')
   })
 
-  connection.on('SendMessage', async (payload: { to: string; text: string }) => {
+  connection.on('SendMessage', async (payload: { to: string; text: string; quotedMessageId?: string }) => {
     // Raw payload exactly as it arrived over SignalR from Messenger-BE.
     // If `to`/`text` are undefined here, the server↔connector property casing
     // is mismatched (server sends a single { to, text } object).
@@ -73,10 +76,39 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     }
 
     try {
-      await sendMessage(payload.to, payload.text)
+      await sendMessage(payload.to, payload.text, payload.quotedMessageId)
       logger.info({ to: payload.to }, '[hub] ✔ sendMessage() completed without throwing')
     } catch (err) {
       logger.error({ err, to: payload.to }, '[hub] ✖ Send failed')
+    }
+  })
+
+  /*
+    Messenger-BE asking which LID a phone number answers to.
+
+    A command down and a separate invoke back up, rather than a SignalR client result, because
+    a connector that predates this simply never registers the handler — the server's push
+    lands nowhere and the contact rules behave exactly as they did before. A client result
+    would leave the server awaiting an answer that is never coming.
+  */
+  connection.on('ResolveLid', async (payload: { pn?: string }) => {
+    const pn = payload?.pn
+
+    if (!pn || !localSession) {
+      logger.warn({ rawPayload: payload }, '[hub] ✖ ResolveLid payload missing "pn" — ignoring')
+      return
+    }
+
+    logger.info({ pn }, '[hub] ◀ ResolveLid command received from Messenger-BE')
+
+    const lid = await resolveLid(pn)
+
+    // Reported even when nothing was found, so the server can stop asking about a number
+    // WhatsApp will not pair — silence here would have it retry on every list load forever.
+    try {
+      await connection.invoke('LidResolved', localSession.sessionId, pn, lid ?? '')
+    } catch (err) {
+      logger.error({ err, pn }, '[hub] ✖ Failed to report the LID lookup result')
     }
   })
 
@@ -140,10 +172,32 @@ async function reconnect(connection: signalR.HubConnection): Promise<void> {
   logger.info('[hub] Reconnecting session — SessionId: %s', session.sessionId)
   try {
     await connection.invoke('Reconnect', session.sessionId)
+    await announceWaState(connection)
     if (!waStarted) initWhatsApp(connection, session.sessionId)
   } catch (err) {
     logger.error({ err }, '[hub] Reconnect failed')
     hubEvents.emit('error', 'Reconnect ke Messenger-BE gagal.')
+  }
+}
+
+/**
+ * Re-report the live WhatsApp link to Messenger-BE after (re)attaching to the hub.
+ *
+ * Messenger-BE holds connector state in an in-memory registry, so every restart — i.e. every
+ * deployment — wipes IsConnected and PhoneNumber. `Reconnect` restores the ConnectionId but not
+ * those two fields: they are only ever set by `Connected`, which is sent from Baileys'
+ * connection-open event. If the WhatsApp socket itself never dropped, that event never fires
+ * again and the server would keep reporting the channel as offline indefinitely.
+ */
+async function announceWaState(connection: signalR.HubConnection): Promise<void> {
+  if (!localSession || !connectedPhoneNumber) return
+
+  try {
+    await connection.invoke('Connected', localSession.sessionId, connectedPhoneNumber)
+    setStatus('connected')
+    logger.info('[hub] Re-announced WhatsApp link (+%s) after hub reconnect', connectedPhoneNumber)
+  } catch (err) {
+    logger.error({ err }, '[hub] Re-announce of WhatsApp link failed')
   }
 }
 
@@ -164,6 +218,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     },
     async (phoneNumber) => {
       logger.info('[wa] Connected as +%s', phoneNumber)
+      connectedPhoneNumber = phoneNumber
       setStatus('connected')
       try {
         await connection.invoke('Connected', sessionId, phoneNumber)
@@ -174,6 +229,7 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     async (reason, shouldReconnect) => {
       logger.info('[wa] Disconnected: %s', reason)
       waStarted = false
+      connectedPhoneNumber = null
       setStatus('disconnected')
       try {
         await connection.invoke('Disconnected', sessionId, reason)
@@ -193,8 +249,19 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
           sessionId,
           agentId: localSession?.agentId ?? '',
           from: msg.from,
+          // A new field on an existing payload, which SignalR resolves by method name and
+          // arity — a connector that predates this simply omits it, and the server reads the
+          // absence as "no second address known" rather than as a contradiction.
+          fromAlt: msg.fromAlt ?? '',
           text: msg.text,
           messageId: msg.messageId,
+          quotedMessageId: msg.quotedMessageId ?? '',
+          quotedText: msg.quotedText ?? '',
+          isGroup: msg.isGroup ?? false,
+          groupName: msg.groupName ?? '',
+          senderJid: msg.senderJid ?? '',
+          senderName: msg.senderName ?? '',
+          isAddressedToBot: msg.isAddressedToBot ?? true,
         })
       } catch (err) {
         logger.error({ err }, '[hub] Failed to forward inbound message')
