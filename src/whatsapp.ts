@@ -523,6 +523,41 @@ export async function resolveLid(pn: string): Promise<string | null> {
   }
 }
 
+/**
+ * Takes this number out of a group.
+ *
+ * The one action here that cannot be undone from our side: WhatsApp requires a fresh invite from
+ * a member to put the agent back, so nothing upstream may offer a re-join. Leaving itself needs
+ * no admin rights — a member can always walk out.
+ *
+ * Returns whether WhatsApp accepted it, which is not the same as whether Messenger-BE thinks the
+ * agent has left: the policy there is stamped before this command is dispatched, deliberately,
+ * because an offline connector never receives it at all and a record that hides a departure is
+ * worse than one that overstates it.
+ */
+export async function leaveGroup(jid: string): Promise<boolean> {
+  if (!activeSocket) {
+    log.warn({ jid }, '[group] ✖ Cannot leave — WhatsApp socket is not connected')
+    return false
+  }
+
+  // Guarded rather than trusted. `groupLeave` on a non-group id is a malformed stanza sent to
+  // WhatsApp's servers, and this address arrives over the wire from another service.
+  if (!jid.endsWith('@g.us')) {
+    log.warn({ jid }, '[group] ✖ Refusing to leave — not a group address')
+    return false
+  }
+
+  try {
+    await activeSocket.groupLeave(jid)
+    log.info({ jid }, '[group] ✔ Left the group')
+    return true
+  } catch (err) {
+    log.error({ err, jid }, '[group] ✖ groupLeave threw')
+    return false
+  }
+}
+
 export async function logout(): Promise<void> {
   if (activeSocket) {
     try { await activeSocket.logout() } catch { /* already disconnected */ }

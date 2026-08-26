@@ -488,6 +488,41 @@ export class WaSession {
     }
   }
 
+  /**
+   * Takes this number out of a group.
+   *
+   * The one action here that cannot be undone from our side: WhatsApp requires a fresh invite
+   * from a member to put the agent back, so nothing upstream may offer a re-join. Leaving needs
+   * no admin rights — a member can always walk out.
+   *
+   * Returns whether WhatsApp accepted it, which is not the same as whether the server thinks the
+   * agent has left: the policy is stamped before the command is dispatched, deliberately, because
+   * an offline connector never receives it and a record that hides a departure is worse than one
+   * that overstates it.
+   */
+  async leaveGroup(jid: string): Promise<boolean> {
+    if (!this.socket) {
+      this.log.warn({ jid }, '[group] ✖ Cannot leave — WhatsApp socket is not connected')
+      return false
+    }
+
+    // Guarded rather than trusted. `groupLeave` on a non-group id is a malformed stanza sent to
+    // WhatsApp's servers, and the address arrives over the wire from another service.
+    if (!jid.endsWith('@g.us')) {
+      this.log.warn({ jid }, '[group] ✖ Refusing to leave — not a group address')
+      return false
+    }
+
+    try {
+      await this.socket.groupLeave(jid)
+      this.log.info({ jid }, '[group] ✔ Left the group')
+      return true
+    } catch (err) {
+      this.log.error({ err, jid }, '[group] ✖ groupLeave threw')
+      return false
+    }
+  }
+
   async logout(): Promise<void> {
     if (this.socket) {
       try { await this.socket.logout() } catch { /* already disconnected */ }

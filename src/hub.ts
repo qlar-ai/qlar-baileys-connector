@@ -2,7 +2,7 @@ import { EventEmitter } from 'events'
 import * as signalR from '@microsoft/signalr'
 import pino from 'pino'
 import { loadSession, saveSession, clearSession, LocalSession } from './session'
-import { startWhatsApp, sendMessage, logout, stopWhatsApp, resolveLid } from './whatsapp'
+import { startWhatsApp, sendMessage, logout, stopWhatsApp, resolveLid, leaveGroup } from './whatsapp'
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -110,6 +110,26 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     } catch (err) {
       logger.error({ err, pn }, '[hub] ✖ Failed to report the LID lookup result')
     }
+  })
+
+  /*
+    Messenger-BE telling us to walk out of a group an operator rejected.
+
+    No answer goes back up. The server has already recorded the departure — it has to, because a
+    connector that is offline never receives this at all — so an invoke here would only confirm
+    something already written. A failure is logged and left; the operator sees the agent is still
+    in the group and can ask again.
+  */
+  connection.on('LeaveGroup', async (payload: { jid?: string }) => {
+    const jid = payload?.jid
+
+    if (!jid) {
+      logger.warn({ rawPayload: payload }, '[hub] ✖ LeaveGroup payload missing "jid" — ignoring')
+      return
+    }
+
+    logger.info({ jid }, '[hub] ◀ LeaveGroup command received from Messenger-BE')
+    await leaveGroup(jid)
   })
 
   connection.on('GenerateQr', () => {

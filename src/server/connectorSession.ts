@@ -132,6 +132,26 @@ export class ConnectorSession {
       }
     })
 
+    /*
+      Messenger-BE telling us to walk out of a group an operator rejected.
+
+      No answer goes back up. The server has already recorded the departure — it has to, because
+      a connector that is offline never receives this at all — so an invoke here would only be
+      confirming something already written. A failure is logged and left; the operator sees the
+      agent is still in the group and can ask again.
+    */
+    connection.on('LeaveGroup', async (payload: { jid?: string }) => {
+      const jid = payload?.jid
+
+      if (!jid) {
+        this.log.warn({ rawPayload: payload }, '[hub] ✖ LeaveGroup payload missing "jid" — ignoring')
+        return
+      }
+
+      this.log.info({ jid }, '[hub] ◀ LeaveGroup command received from Messenger-BE')
+      await this.wa?.leaveGroup(jid)
+    })
+
     connection.on('GenerateQr', () => {
       this.log.info('[hub] GenerateQr — restarting Baileys')
       this.wa?.stop()
