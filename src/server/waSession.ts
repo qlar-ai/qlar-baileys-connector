@@ -45,6 +45,17 @@ export interface InboundMessage {
    * only the connector knows the bot's own JID and LID.
    */
   isAddressedToBot?: boolean
+  /**
+   * Whether the message @mentions somebody who is not the bot. The cheapest possible "this is
+   * not for us": an @ of another member is a message aimed at that member.
+   */
+  mentionsOthers?: boolean
+  /**
+   * When this message quotes another, whether the quoted message was the bot's own. A reply to
+   * the bot is addressed to it; a reply to another member is addressed to that member. False
+   * when nothing is quoted.
+   */
+  quotedFromAgent?: boolean
 }
 
 /**
@@ -144,18 +155,52 @@ export class WaSession {
    * later messages overtake earlier ones. The first message from a group therefore carries an
    * empty name and every one after it is named.
    */
+  /**
+   * Returns the cached group subject, kicking off a lookup when it is not known yet.
+   * Deliberately non-blocking so later messages cannot overtake earlier ones.
+   *
+   * A failed or empty lookup **forgets the key** rather than caching the empty string. Reserving
+   * the key and leaving it reserved is what made some groups permanently nameless: the reservation
+   * reads as a cached answer, so a lookup that failed once — a socket mid-reconnect, a rate-limited
+   * metadata call — was never retried for the life of the process.
+   */
   private groupSubject(jid: string): string {
     const cached = this.groupSubjects.get(jid)
 
-    if (cached !== undefined) return cached
+    if (cached) return cached
 
-    // Reserve the key so concurrent messages don't each fire their own lookup.
+    // No socket, no lookup — and no reservation either, or the next message would read the
+    // reservation as a cached answer and never try again.
+    if (!this.socket) return ''
+
+    // A reservation only while a lookup is genuinely in flight.
+    if (cached === '') return ''
+
     this.groupSubjects.set(jid, '')
 
     void this.socket
-      ?.groupMetadata(jid)
-      .then((meta) => this.groupSubjects.set(jid, meta?.subject ?? ''))
-      .catch((err) => this.log.warn({ err, jid }, '[wa] group metadata lookup failed'))
+      .groupMetadata(jid)
+      .then((meta) => {
+        const subject = meta?.subject ?? ''
+
+        if (subject) {
+          this.groupSubjects.set(jid, subject)
+          this.log.info({ jid, subject }, '[wa] group subject resolved')
+          return
+        }
+
+        // Resolved to nothing. Forgotten rather than cached, so a group renamed after a blank
+        // answer eventually gets its name.
+        this.groupSubjects.delete(jid)
+      })
+      .catch((err) => {
+        // Dropped so the next message retries. This is the line that was missing.
+        this.groupSubjects.delete(jid)
+        this.log.warn(
+          { err, jid },
+          '[wa] group metadata lookup failed — will retry on the next message',
+        )
+      })
 
     return ''
   }
@@ -171,18 +216,29 @@ export class WaSession {
    * either, so both are compared. Matching only the phone number would leave the bot deaf in
    * every LID-migrated group.
    */
-  private isAddressedToBot(contextInfo: proto.IContextInfo | null | undefined): boolean {
+  private readAddressing(
+    contextInfo: proto.IContextInfo | null | undefined,
+  ): Pick<InboundMessage, 'isAddressedToBot' | 'mentionsOthers' | 'quotedFromAgent'> {
     const me = [this.socket?.user?.id, this.socket?.user?.lid].filter(Boolean) as string[]
 
-    if (me.length === 0) return false
+    // No identity yet means no honest answer to any of the three. All false reads upstream as
+    // "unknown", which costs a free negative and never invents one.
+    if (me.length === 0) {
+      return { isAddressedToBot: false, mentionsOthers: false, quotedFromAgent: false }
+    }
+
+    const isMe = (jid: string | null | undefined) =>
+      !!jid && me.some((mine) => areJidsSameUser(jid, mine))
 
     const mentioned = contextInfo?.mentionedJid ?? []
+    const mentionsBot = mentioned.some(isMe)
+    const mentionsOthers = mentioned.some((jid) => !isMe(jid))
 
-    if (mentioned.some((jid) => me.some((mine) => areJidsSameUser(jid, mine)))) return true
+    // The *author* of the quoted message, so this is "did they reply to us" rather than
+    // "did they reply at all".
+    const quotedFromAgent = isMe(contextInfo?.participant)
 
-    const quotedAuthor = contextInfo?.participant
-
-    return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+    return { isAddressedToBot: mentionsBot || quotedFromAgent, mentionsOthers, quotedFromAgent }
   }
 
   /** The text of a message, whichever content type happens to carry it. */
@@ -341,8 +397,11 @@ export class WaSession {
           senderJid: isGroup ? (msg.key.participant ?? '') : from,
           senderName: msg.pushName ?? '',
           groupName: isGroup ? this.groupSubject(from) : '',
-          // Individual chats are always addressed to the bot; groups have to earn it.
-          isAddressedToBot: isGroup ? this.isAddressedToBot(contextInfo) : true,
+          // Individual chats are always addressed to the bot; groups have to earn it. The other
+          // two are group-only by nature — in a one-to-one chat there is nobody else to aim at.
+          ...(isGroup
+            ? this.readAddressing(contextInfo)
+            : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }),
         })
       }
     })

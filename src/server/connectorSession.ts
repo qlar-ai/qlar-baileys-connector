@@ -312,6 +312,8 @@ export class ConnectorSession {
               senderJid: msg.senderJid ?? '',
               senderName: msg.senderName ?? '',
               isAddressedToBot: msg.isAddressedToBot ?? true,
+              mentionsOthers: msg.mentionsOthers ?? false,
+              quotedFromAgent: msg.quotedFromAgent ?? false,
             })
             .catch((err) => this.log.error({ err }, '[hub] MessageInbound failed'))
         },

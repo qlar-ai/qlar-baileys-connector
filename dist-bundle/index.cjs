@@ -165895,6 +165895,65 @@ function describeError(err) {
   return { raw: String(err) };
 }
 var messageStore = /* @__PURE__ */ new Map();
+var quotableStore = /* @__PURE__ */ new Map();
+function cacheQuotable(msg) {
+  const id = msg.key?.id;
+  if (!id) return;
+  if (quotableStore.size > 500) {
+    const oldest = quotableStore.keys().next().value;
+    if (oldest !== void 0) quotableStore.delete(oldest);
+  }
+  quotableStore.set(id, msg);
+}
+var groupSubjects = /* @__PURE__ */ new Map();
+function groupSubject(jid) {
+  const cached = groupSubjects.get(jid);
+  if (cached) return cached;
+  if (!activeSocket) return "";
+  if (cached === "") return "";
+  groupSubjects.set(jid, "");
+  void activeSocket.groupMetadata(jid).then((meta) => {
+    const subject = meta?.subject ?? "";
+    if (subject) {
+      groupSubjects.set(jid, subject);
+      log2.info({ jid, subject }, "[wa] group subject resolved");
+      return;
+    }
+    groupSubjects.delete(jid);
+  }).catch((err) => {
+    groupSubjects.delete(jid);
+    log2.warn({ err, jid }, "[wa] group metadata lookup failed \u2014 will retry on the next message");
+  });
+  return "";
+}
+function readAddressing(contextInfo) {
+  const me = [activeSocket?.user?.id, activeSocket?.user?.lid].filter(Boolean);
+  if (me.length === 0) {
+    return { isAddressedToBot: false, mentionsOthers: false, quotedFromAgent: false };
+  }
+  const isMe = (jid) => !!jid && me.some((mine) => areJidsSameUser(jid, mine));
+  const mentioned = contextInfo?.mentionedJid ?? [];
+  const mentionsBot = mentioned.some(isMe);
+  const mentionsOthers = mentioned.some((jid) => !isMe(jid));
+  const quotedAuthor = contextInfo?.participant;
+  const quotedFromAgent = isMe(quotedAuthor);
+  return {
+    isAddressedToBot: mentionsBot || quotedFromAgent,
+    mentionsOthers,
+    quotedFromAgent
+  };
+}
+function contextInfoOf(message) {
+  return message.extendedTextMessage?.contextInfo ?? message.imageMessage?.contextInfo ?? message.videoMessage?.contextInfo ?? message.documentMessage?.contextInfo;
+}
+function readQuoteContext(contextInfo) {
+  const quoted = contextInfo?.quotedMessage;
+  if (!contextInfo?.stanzaId || !quoted) return {};
+  return {
+    quotedMessageId: contextInfo.stanzaId,
+    quotedText: quoted.conversation ?? quoted.extendedTextMessage?.text ?? quoted.imageMessage?.caption ?? quoted.videoMessage?.caption ?? ""
+  };
+}
 function cacheMessage(id, message) {
   if (!id || !message) return;
   if (messageStore.size > 2e3) {
@@ -165974,13 +166033,31 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const from = msg.key.remoteJid ?? "";
+      const fromAlt = msg.key.remoteJidAlt ?? "";
       const text = msg.message.conversation ?? msg.message.extendedTextMessage?.text ?? msg.message.imageMessage?.caption ?? "";
       if (!text || !from) continue;
+      cacheQuotable(msg);
+      const contextInfo = contextInfoOf(msg.message);
+      const isGroup = isJidGroup(from) ?? false;
       log2.info(
-        { from, messageId: msg.key.id, textPreview: text.slice(0, 120) },
+        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
         "[in] \u2190 inbound message forwarded to hub"
       );
-      onMessage({ from, text, messageId: msg.key.id ?? "" });
+      onMessage({
+        from,
+        fromAlt,
+        text,
+        messageId: msg.key.id ?? "",
+        ...readQuoteContext(contextInfo),
+        isGroup,
+        // In a group `from` is the group itself, so the individual comes off the key.
+        senderJid: isGroup ? msg.key.participant ?? "" : from,
+        senderName: msg.pushName ?? "",
+        groupName: isGroup ? groupSubject(from) : "",
+        // Individual chats are always addressed to the bot; groups have to earn it. The other two
+        // are group-only by nature — in a one-to-one chat there is nobody else to be aiming at.
+        ...isGroup ? readAddressing(contextInfo) : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }
+      });
     }
   });
   socket.ev.on("messages.update", (updates) => {
@@ -166012,7 +166089,7 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
     }
   });
 }
-async function sendMessage(to, text) {
+async function sendMessage(to, text, quotedMessageId) {
   const startedAt = Date.now();
   log2.info(
     { to, textLength: text?.length ?? 0, textPreview: (text ?? "").slice(0, 200) },
@@ -166045,12 +166122,16 @@ async function sendMessage(to, text) {
       log2.warn({ jid, error: describeError(e) }, "[send] STEP 2b \u2014 onWhatsApp() probe failed");
     }
   }
+  const quoted = quotedMessageId ? quotableStore.get(quotedMessageId) : void 0;
+  if (quotedMessageId && !quoted) {
+    log2.warn({ quotedMessageId }, "[send] quoted message not in cache \u2014 sending unquoted");
+  }
   log2.debug(
-    { jid, payload: { text } },
+    { jid, payload: { text }, quotingMessageId: quotedMessageId ?? null, quoteResolved: !!quoted },
     "[send] STEP 3 \u2014 calling sock.sendMessage() (payload about to be encrypted + pushed to WhatsApp)"
   );
   try {
-    const result = await activeSocket.sendMessage(jid, { text });
+    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : void 0);
     cacheMessage(result?.key?.id, result?.message);
     log2.info(`test phil ${JSON.stringify(result)}`);
     log2.info(
@@ -166080,6 +166161,44 @@ async function sendMessage(to, text) {
       "[send] \u2716 STEP 4 \u2014 sock.sendMessage() THREW (failed to push payload to WhatsApp)"
     );
     throw err;
+  }
+}
+async function resolveLid(pn) {
+  if (!activeSocket) {
+    log2.warn({ pn }, "[lid] \u2716 Cannot resolve \u2014 WhatsApp socket is not connected");
+    return null;
+  }
+  const jid = pn.includes("@") ? pn : `${pn}@s.whatsapp.net`;
+  if (jid.endsWith("@lid") || jid.endsWith("@g.us")) {
+    log2.debug({ pn }, "[lid] Nothing to resolve \u2014 already a LID or a group");
+    return null;
+  }
+  try {
+    const raw2 = await activeSocket.signalRepository?.lidMapping?.getLIDForPN(jid);
+    const lid = typeof raw2 === "string" ? raw2.replace(/:\d+@lid$/, "@lid") : null;
+    log2.info({ pn: jid, raw: raw2 ?? null, lid }, lid ? "[lid] \u2714 Resolved phone number to LID" : "[lid] \u2014 WhatsApp returned no LID for this number");
+    return lid;
+  } catch (err) {
+    log2.error({ err, pn: jid }, "[lid] \u2716 LID lookup threw");
+    return null;
+  }
+}
+async function leaveGroup(jid) {
+  if (!activeSocket) {
+    log2.warn({ jid }, "[group] \u2716 Cannot leave \u2014 WhatsApp socket is not connected");
+    return false;
+  }
+  if (!jid.endsWith("@g.us")) {
+    log2.warn({ jid }, "[group] \u2716 Refusing to leave \u2014 not a group address");
+    return false;
+  }
+  try {
+    await activeSocket.groupLeave(jid);
+    log2.info({ jid }, "[group] \u2714 Left the group");
+    return true;
+  } catch (err) {
+    log2.error({ err, jid }, "[group] \u2716 groupLeave threw");
+    return false;
   }
 }
 async function logout() {
@@ -166114,6 +166233,7 @@ function stopWhatsApp() {
 var logger = (0, import_pino3.default)({ level: process.env.LOG_LEVEL ?? "info" });
 var localSession = null;
 var waStarted = false;
+var connectedPhoneNumber = null;
 var reconnectTimer = null;
 var hubEvents = new import_events4.EventEmitter();
 var currentStatus = "disconnected";
@@ -166156,11 +166276,34 @@ function connectToHub(hubUrl2, pairingCode) {
       return;
     }
     try {
-      await sendMessage(payload.to, payload.text);
+      await sendMessage(payload.to, payload.text, payload.quotedMessageId);
       logger.info({ to: payload.to }, "[hub] \u2714 sendMessage() completed without throwing");
     } catch (err) {
       logger.error({ err, to: payload.to }, "[hub] \u2716 Send failed");
     }
+  });
+  connection.on("ResolveLid", async (payload) => {
+    const pn = payload?.pn;
+    if (!pn || !localSession) {
+      logger.warn({ rawPayload: payload }, '[hub] \u2716 ResolveLid payload missing "pn" \u2014 ignoring');
+      return;
+    }
+    logger.info({ pn }, "[hub] \u25C0 ResolveLid command received from Messenger-BE");
+    const lid = await resolveLid(pn);
+    try {
+      await connection.invoke("LidResolved", localSession.sessionId, pn, lid ?? "");
+    } catch (err) {
+      logger.error({ err, pn }, "[hub] \u2716 Failed to report the LID lookup result");
+    }
+  });
+  connection.on("LeaveGroup", async (payload) => {
+    const jid = payload?.jid;
+    if (!jid) {
+      logger.warn({ rawPayload: payload }, '[hub] \u2716 LeaveGroup payload missing "jid" \u2014 ignoring');
+      return;
+    }
+    logger.info({ jid }, "[hub] \u25C0 LeaveGroup command received from Messenger-BE");
+    await leaveGroup(jid);
   });
   connection.on("GenerateQr", () => {
     logger.info("[hub] GenerateQr command received \u2014 restarting Baileys");
@@ -166213,10 +166356,21 @@ async function reconnect(connection) {
   logger.info("[hub] Reconnecting session \u2014 SessionId: %s", session2.sessionId);
   try {
     await connection.invoke("Reconnect", session2.sessionId);
+    await announceWaState(connection);
     if (!waStarted) initWhatsApp(connection, session2.sessionId);
   } catch (err) {
     logger.error({ err }, "[hub] Reconnect failed");
     hubEvents.emit("error", "Reconnect ke Messenger-BE gagal.");
+  }
+}
+async function announceWaState(connection) {
+  if (!localSession || !connectedPhoneNumber) return;
+  try {
+    await connection.invoke("Connected", localSession.sessionId, connectedPhoneNumber);
+    setStatus("connected");
+    logger.info("[hub] Re-announced WhatsApp link (+%s) after hub reconnect", connectedPhoneNumber);
+  } catch (err) {
+    logger.error({ err }, "[hub] Re-announce of WhatsApp link failed");
   }
 }
 function initWhatsApp(connection, sessionId) {
@@ -166237,6 +166391,7 @@ function initWhatsApp(connection, sessionId) {
     },
     async (phoneNumber) => {
       logger.info("[wa] Connected as +%s", phoneNumber);
+      connectedPhoneNumber = phoneNumber;
       setStatus("connected");
       try {
         await connection.invoke("Connected", sessionId, phoneNumber);
@@ -166247,6 +166402,7 @@ function initWhatsApp(connection, sessionId) {
     async (reason, shouldReconnect) => {
       logger.info("[wa] Disconnected: %s", reason);
       waStarted = false;
+      connectedPhoneNumber = null;
       setStatus("disconnected");
       try {
         await connection.invoke("Disconnected", sessionId, reason);
@@ -166266,8 +166422,21 @@ function initWhatsApp(connection, sessionId) {
           sessionId,
           agentId: localSession?.agentId ?? "",
           from: msg.from,
+          // A new field on an existing payload, which SignalR resolves by method name and
+          // arity — a connector that predates this simply omits it, and the server reads the
+          // absence as "no second address known" rather than as a contradiction.
+          fromAlt: msg.fromAlt ?? "",
           text: msg.text,
-          messageId: msg.messageId
+          messageId: msg.messageId,
+          quotedMessageId: msg.quotedMessageId ?? "",
+          quotedText: msg.quotedText ?? "",
+          isGroup: msg.isGroup ?? false,
+          groupName: msg.groupName ?? "",
+          senderJid: msg.senderJid ?? "",
+          senderName: msg.senderName ?? "",
+          isAddressedToBot: msg.isAddressedToBot ?? true,
+          mentionsOthers: msg.mentionsOthers ?? false,
+          quotedFromAgent: msg.quotedFromAgent ?? false
         });
       } catch (err) {
         logger.error({ err }, "[hub] Failed to forward inbound message");
@@ -166531,7 +166700,7 @@ function readBody(req) {
 }
 
 // src/index.ts
-var DEFAULT_HUB_URL = "https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector";
+var DEFAULT_HUB_URL = "https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector";
 function parseArgs() {
   const args = process.argv.slice(2);
   const result = {};

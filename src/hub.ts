@@ -282,6 +282,8 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
           senderJid: msg.senderJid ?? '',
           senderName: msg.senderName ?? '',
           isAddressedToBot: msg.isAddressedToBot ?? true,
+          mentionsOthers: msg.mentionsOthers ?? false,
+          quotedFromAgent: msg.quotedFromAgent ?? false,
         })
       } catch (err) {
         logger.error({ err }, '[hub] Failed to forward inbound message')

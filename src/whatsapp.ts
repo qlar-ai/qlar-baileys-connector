@@ -48,6 +48,22 @@ export interface InboundMessage {
    * only the connector knows the bot's own JID and LID.
    */
   isAddressedToBot?: boolean
+  /**
+   * Whether the message @mentions somebody who is not the bot.
+   *
+   * The cheapest possible "this is not for us": an @ of another member is a message aimed at
+   * that member, and knowing so costs nothing and no model call. Resolved here for the same
+   * reason as `isAddressedToBot` — the comparison needs the bot's own JID *and* LID.
+   */
+  mentionsOthers?: boolean
+  /**
+   * When this message quotes another, whether the quoted message was the bot's own.
+   *
+   * Distinct from `quotedMessageId` being present, and the distinction is the whole point: a
+   * reply to the bot is addressed to it, while a reply to another member is addressed to that
+   * member. Meaningless when nothing is quoted, and false in that case.
+   */
+  quotedFromAgent?: boolean
 }
 
 export type OnQr = (qrBase64: string) => void
@@ -130,19 +146,49 @@ const groupSubjects = new Map<string, string>()
 /**
  * Returns the cached group subject, kicking off a lookup when it is not known yet.
  * Deliberately non-blocking so later messages cannot overtake earlier ones.
+ *
+ * A failed or empty lookup **forgets the key** rather than caching the empty string, and that is
+ * the whole point of the retry. Reserving the key and leaving it reserved is what made some groups
+ * permanently nameless: the reservation reads as a cached answer, so a lookup that failed once —
+ * because the socket was mid-reconnect, or WhatsApp rate-limited the metadata call — was never
+ * retried for the life of the process, however many messages arrived from that group afterwards.
  */
 function groupSubject(jid: string): string {
   const cached = groupSubjects.get(jid)
 
-  if (cached !== undefined) return cached
+  if (cached) return cached
 
-  // Reserve the key so concurrent messages don't each fire their own lookup.
+  // No socket, no lookup — and crucially no reservation either, or the next message would read
+  // the reservation as a cached answer and never try again.
+  if (!activeSocket) return ''
+
+  // A reservation only while a lookup is genuinely in flight, so concurrent messages from the
+  // same group don't each fire one.
+  if (cached === '') return ''
+
   groupSubjects.set(jid, '')
 
   void activeSocket
-    ?.groupMetadata(jid)
-    .then((meta) => groupSubjects.set(jid, meta?.subject ?? ''))
-    .catch((err) => log.warn({ err, jid }, '[wa] group metadata lookup failed'))
+    .groupMetadata(jid)
+    .then((meta) => {
+      const subject = meta?.subject ?? ''
+
+      if (subject) {
+        groupSubjects.set(jid, subject)
+        log.info({ jid, subject }, '[wa] group subject resolved')
+        return
+      }
+
+      // Resolved to nothing. Forget it rather than caching the emptiness: a group with a genuinely
+      // blank subject costs one cheap lookup per message, and a group that was renamed after a
+      // blank answer gets its name.
+      groupSubjects.delete(jid)
+    })
+    .catch((err) => {
+      // Dropped so the next message retries. This is the line that was missing.
+      groupSubjects.delete(jid)
+      log.warn({ err, jid }, '[wa] group metadata lookup failed — will retry on the next message')
+    })
 
   return ''
 }
@@ -158,18 +204,34 @@ function groupSubject(jid: string): string {
  * so both are compared. Matching only the phone number would leave the bot deaf in every
  * LID-migrated group.
  */
-function isAddressedToBot(contextInfo: proto.IContextInfo | null | undefined): boolean {
+function readAddressing(
+  contextInfo: proto.IContextInfo | null | undefined,
+): Pick<InboundMessage, 'isAddressedToBot' | 'mentionsOthers' | 'quotedFromAgent'> {
   const me = [activeSocket?.user?.id, activeSocket?.user?.lid].filter(Boolean) as string[]
 
-  if (me.length === 0) return false
+  // No identity yet means no honest answer to any of the three. All false reads upstream as
+  // "unknown", which costs a free negative and never invents one.
+  if (me.length === 0) {
+    return { isAddressedToBot: false, mentionsOthers: false, quotedFromAgent: false }
+  }
+
+  const isMe = (jid: string | null | undefined) =>
+    !!jid && me.some((mine) => areJidsSameUser(jid, mine))
 
   const mentioned = contextInfo?.mentionedJid ?? []
+  const mentionsBot = mentioned.some(isMe)
+  const mentionsOthers = mentioned.some((jid) => !isMe(jid))
 
-  if (mentioned.some((jid) => me.some((mine) => areJidsSameUser(jid, mine)))) return true
-
+  // Present only when something is quoted, and it is the *author* of the quoted message — so
+  // this is "did they reply to us" rather than "did they reply at all".
   const quotedAuthor = contextInfo?.participant
+  const quotedFromAgent = isMe(quotedAuthor)
 
-  return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+  return {
+    isAddressedToBot: mentionsBot || quotedFromAgent,
+    mentionsOthers,
+    quotedFromAgent,
+  }
 }
 
 /** WhatsApp hangs contextInfo off whichever content type carries the text. */
@@ -334,8 +396,11 @@ export async function startWhatsApp(
         senderJid: isGroup ? (msg.key.participant ?? '') : from,
         senderName: msg.pushName ?? '',
         groupName: isGroup ? groupSubject(from) : '',
-        // Individual chats are always addressed to the bot; groups have to earn it.
-        isAddressedToBot: isGroup ? isAddressedToBot(contextInfo) : true,
+        // Individual chats are always addressed to the bot; groups have to earn it. The other two
+        // are group-only by nature — in a one-to-one chat there is nobody else to be aiming at.
+        ...(isGroup
+          ? readAddressing(contextInfo)
+          : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }),
       })
     }
   })
