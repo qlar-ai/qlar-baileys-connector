@@ -143,6 +143,127 @@ function cacheQuotable(msg: WAMessage): void {
 // carries no name — never worth blocking message delivery on a metadata round-trip.
 const groupSubjects = new Map<string, string>()
 
+/*
+  Display names, learned as people speak — see the same maps in `server/waSession.ts`.
+
+  WhatsApp does not put names in a message's text. Somebody typing "@Mega Syintia" sends
+  "@270875081363521"; the name is rendered by the reader's own client from `mentionedJid`. Without
+  this, the agent reads an id and repeats it back.
+*/
+const displayNames = new Map<string, string>()
+// The full jid each person was last seen under. A mention must go back out in the domain the room
+// actually uses — a lid room will not resolve an @s.whatsapp.net jid.
+const knownJids = new Map<string, string>()
+
+/** The numeric part of a jid — the form a mention takes inside message text. */
+function jidDigits(jid: string): string {
+  return jid.split('@')[0]?.split(':')[0] ?? ''
+}
+
+/**
+ * Records every member of a group, so a mention does not depend on having heard them speak.
+ *
+ * Names are taken only when WhatsApp supplies one — `notify`/`name` are usually blank in a LID
+ * room unless the person is in your address book. The jid is the part that matters: with it,
+ * "@<id>" in an outgoing message becomes a real mention even for somebody with no name at all,
+ * and a saved contact was never required for that.
+ */
+function rememberParticipants(
+  participants: { id?: string | null; name?: string | null; notify?: string | null }[] | null | undefined,
+): void {
+  if (!participants) return
+
+  for (const p of participants) {
+    const digits = jidDigits(p?.id ?? '')
+    if (!digits) continue
+
+    // Never downgrade a name learned from speech, which is the more current of the two.
+    if (!knownJids.has(digits)) knownJids.set(digits, p.id!)
+
+    const supplied = (p.notify ?? p.name ?? '').trim()
+    if (supplied && !displayNames.has(digits)) displayNames.set(digits, supplied)
+  }
+}
+
+/** Records somebody's display name against the digits of their jid. */
+function rememberName(jid: string | null | undefined, pushName: string | null | undefined): void {
+  if (!jid || !pushName) return
+
+  const digits = jidDigits(jid)
+  if (!digits) return
+
+  displayNames.set(digits, pushName.trim())
+  knownJids.set(digits, jid)
+}
+
+/**
+ * Rewrites "@<id>" in inbound text to "@<display name>".
+ *
+ * Driven by `mentionedJid` rather than by scanning for digit runs, so a price or a year in a
+ * sentence is never mistaken for a mention. An id with no known name is left as it arrived.
+ */
+function namesForIds(text: string, contextInfo: proto.IContextInfo | null | undefined): string {
+  const mentioned = contextInfo?.mentionedJid ?? []
+  if (mentioned.length === 0) return text
+
+  let out = text
+
+  for (const jid of mentioned) {
+    const digits = jidDigits(jid ?? '')
+    if (!digits) continue
+
+    const name = displayNames.get(digits)
+    if (!name) continue
+
+    out = out.split(`@${digits}`).join(`@${name}`)
+  }
+
+  return out
+}
+
+/**
+ * Turns "@<display name>" in an outgoing message back into a real WhatsApp mention.
+ *
+ * Longest name first, so "@Mega Syintia" is not half-matched by a "@Mega" who also exists. An
+ * unresolved name stays plain text: the worst outcome is a mention that does not light up, never
+ * one pointing at the wrong person.
+ */
+function idsForNames(text: string): { text: string; mentions: string[] } {
+  if (!text.includes('@')) return { text, mentions: [] }
+
+  let out = text
+
+  // Names first, longest wins, so "@Mega Syintia" is not half-matched by a "@Mega" who exists.
+  const byLongestName = [...displayNames.entries()].sort(([, a], [, b]) => b.length - a.length)
+
+  for (const [digits, name] of byLongestName) {
+    if (!name) continue
+
+    const needle = `@${name}`
+    if (!out.includes(needle)) continue
+
+    out = out.split(needle).join(`@${digits}`)
+  }
+
+  /*
+    Then collect ids — the same scan for both routes. Names have just become ids above, and an id
+    may also have been written directly, for a member nobody has a name for. Both are the wire form
+    a mention needs, so the cases converge here.
+
+    Only recognised ids are claimed; an unknown one stays plain text.
+  */
+  const mentions = [
+    ...new Set(
+      [...out.matchAll(/@(\d{5,})/g)]
+        .map((m) => m[1]!)
+        .filter((digits) => knownJids.has(digits))
+        .map((digits) => knownJids.get(digits)!),
+    ),
+  ]
+
+  return { text: out, mentions }
+}
+
 /**
  * Returns the cached group subject, kicking off a lookup when it is not known yet.
  * Deliberately non-blocking so later messages cannot overtake earlier ones.
@@ -171,6 +292,10 @@ function groupSubject(jid: string): string {
   void activeSocket
     .groupMetadata(jid)
     .then((meta) => {
+      // Free ride on a lookup already happening: participants give us every member's jid whether
+      // they have spoken or not, which is what lets the agent mention somebody silent.
+      rememberParticipants(meta?.participants)
+
       const subject = meta?.subject ?? ''
 
       if (subject) {
@@ -385,10 +510,14 @@ export async function startWhatsApp(
         '[in] ← inbound message forwarded to hub',
       )
 
+      // Learned before the text is rewritten, so a message mentioning its own sender resolves too.
+      rememberName(isGroup ? msg.key.participant : from, msg.pushName)
+
       onMessage({
         from,
         fromAlt,
-        text,
+        // Names rather than ids, so the agent reads what a person reads.
+        text: namesForIds(text, contextInfo),
         messageId: msg.key.id ?? '',
         ...readQuoteContext(contextInfo),
         isGroup,
@@ -504,7 +633,15 @@ export async function sendMessage(to: string, text: string, quotedMessageId?: st
   )
 
   try {
-    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
+    // The agent writes "@Mega Syintia"; WhatsApp needs the id in the text plus the jid in
+    // `mentions`, and renders the name back for whoever reads it.
+    const { text: outgoing, mentions } = idsForNames(text)
+
+    const result = await activeSocket.sendMessage(
+      jid,
+      mentions.length > 0 ? { text: outgoing, mentions } : { text: outgoing },
+      quoted ? { quoted } : undefined,
+    )
     cacheMessage(result?.key?.id, result?.message)
     log.info(`test phil ${JSON.stringify(result)}`)
 

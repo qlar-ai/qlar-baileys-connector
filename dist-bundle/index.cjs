@@ -165906,6 +165906,58 @@ function cacheQuotable(msg) {
   quotableStore.set(id, msg);
 }
 var groupSubjects = /* @__PURE__ */ new Map();
+var displayNames = /* @__PURE__ */ new Map();
+var knownJids = /* @__PURE__ */ new Map();
+function jidDigits(jid) {
+  return jid.split("@")[0]?.split(":")[0] ?? "";
+}
+function rememberParticipants(participants) {
+  if (!participants) return;
+  for (const p of participants) {
+    const digits = jidDigits(p?.id ?? "");
+    if (!digits) continue;
+    if (!knownJids.has(digits)) knownJids.set(digits, p.id);
+    const supplied = (p.notify ?? p.name ?? "").trim();
+    if (supplied && !displayNames.has(digits)) displayNames.set(digits, supplied);
+  }
+}
+function rememberName(jid, pushName) {
+  if (!jid || !pushName) return;
+  const digits = jidDigits(jid);
+  if (!digits) return;
+  displayNames.set(digits, pushName.trim());
+  knownJids.set(digits, jid);
+}
+function namesForIds(text, contextInfo) {
+  const mentioned = contextInfo?.mentionedJid ?? [];
+  if (mentioned.length === 0) return text;
+  let out = text;
+  for (const jid of mentioned) {
+    const digits = jidDigits(jid ?? "");
+    if (!digits) continue;
+    const name = displayNames.get(digits);
+    if (!name) continue;
+    out = out.split(`@${digits}`).join(`@${name}`);
+  }
+  return out;
+}
+function idsForNames(text) {
+  if (!text.includes("@")) return { text, mentions: [] };
+  let out = text;
+  const byLongestName = [...displayNames.entries()].sort(([, a], [, b]) => b.length - a.length);
+  for (const [digits, name] of byLongestName) {
+    if (!name) continue;
+    const needle = `@${name}`;
+    if (!out.includes(needle)) continue;
+    out = out.split(needle).join(`@${digits}`);
+  }
+  const mentions = [
+    ...new Set(
+      [...out.matchAll(/@(\d{5,})/g)].map((m) => m[1]).filter((digits) => knownJids.has(digits)).map((digits) => knownJids.get(digits))
+    )
+  ];
+  return { text: out, mentions };
+}
 function groupSubject(jid) {
   const cached = groupSubjects.get(jid);
   if (cached) return cached;
@@ -165913,6 +165965,7 @@ function groupSubject(jid) {
   if (cached === "") return "";
   groupSubjects.set(jid, "");
   void activeSocket.groupMetadata(jid).then((meta) => {
+    rememberParticipants(meta?.participants);
     const subject = meta?.subject ?? "";
     if (subject) {
       groupSubjects.set(jid, subject);
@@ -166043,10 +166096,12 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
         { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
         "[in] \u2190 inbound message forwarded to hub"
       );
+      rememberName(isGroup ? msg.key.participant : from, msg.pushName);
       onMessage({
         from,
         fromAlt,
-        text,
+        // Names rather than ids, so the agent reads what a person reads.
+        text: namesForIds(text, contextInfo),
         messageId: msg.key.id ?? "",
         ...readQuoteContext(contextInfo),
         isGroup,
@@ -166131,7 +166186,12 @@ async function sendMessage(to, text, quotedMessageId) {
     "[send] STEP 3 \u2014 calling sock.sendMessage() (payload about to be encrypted + pushed to WhatsApp)"
   );
   try {
-    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : void 0);
+    const { text: outgoing, mentions } = idsForNames(text);
+    const result = await activeSocket.sendMessage(
+      jid,
+      mentions.length > 0 ? { text: outgoing, mentions } : { text: outgoing },
+      quoted ? { quoted } : void 0
+    );
     cacheMessage(result?.key?.id, result?.message);
     log2.info(`test phil ${JSON.stringify(result)}`);
     log2.info(
