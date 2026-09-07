@@ -3,6 +3,35 @@ import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { WaSession } from './waSession'
 
+/**
+ * A file name whose extension matches the audio, because the transcription provider infers the
+ * container from it and rejects a mismatch outright — a WhatsApp voice note named `.webm` fails
+ * with an HTTP 400 rather than being sniffed and accepted.
+ *
+ * Falls back to `.ogg`, which is what WhatsApp voice notes actually are. A guess is unavoidable
+ * when the mime type is missing, and that is the one worth making.
+ */
+function voiceNoteFileName(mimeType: string): string {
+  const type = (mimeType || '').split(';')[0].trim().toLowerCase()
+
+  const extensions: Record<string, string> = {
+    'audio/ogg': 'ogg',
+    'audio/opus': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/m4a': 'm4a',
+    'audio/x-m4a': 'm4a',
+    'audio/aac': 'm4a',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/webm': 'webm',
+    'audio/amr': 'amr',
+  }
+
+  return `voice-note.${extensions[type] ?? 'ogg'}`
+}
+
 export interface SessionMeta {
   sessionId: string
   agentId: string
@@ -103,6 +132,34 @@ export class ConnectorSession {
     )
 
     /*
+      A spoken answer, to be delivered as a WhatsApp voice note.
+
+      Its own client method for the same reason SendReaction is: a connector that has not been
+      redeployed never registers this handler, and the push lands nowhere. Which is why the server
+      only sends it after DeclareVoiceSupport — see declareVoiceSupport below.
+
+      Nothing is reported back. The written answer has already been delivered by the time this
+      arrives, so a failure here costs the spoken copy of something the user already has, and there
+      is no id upstream needs: a reaction on a voice note is not something the agent can answer.
+    */
+    connection.on(
+      'SendAudioMessage',
+      async (payload: { to: string; audioBase64: string; seconds?: number; mimeType?: string }) => {
+        if (!payload?.to || !payload?.audioBase64) return
+        try {
+          await this.wa?.sendAudioMessage(
+            payload.to,
+            payload.audioBase64,
+            payload.seconds ?? 0,
+            payload.mimeType ?? 'audio/ogg; codecs=opus',
+          )
+        } catch (err) {
+          this.log.error({ err, to: payload.to }, '[hub] send voice note failed')
+        }
+      },
+    )
+
+    /*
       Messenger-BE asking which LID a phone number answers to.
 
       A command down and a separate invoke back up, rather than a SignalR client result, because
@@ -176,6 +233,7 @@ export class ConnectorSession {
         // otherwise leave it reporting this channel as self-hosted — and the CMS would
         // quietly stop showing the idle-revocation warning until the process restarted.
         await this.declareHosted()
+        await this.declareVoiceSupport()
         await this.announceWaState()
       } catch (err) {
         this.log.error({ err }, '[hub] re-register after reconnect failed')
@@ -188,6 +246,7 @@ export class ConnectorSession {
       // Restored session — re-register straight away.
       await connection.invoke('Reconnect', this.sessionId)
       await this.declareHosted()
+      await this.declareVoiceSupport()
       await this.announceWaState()
       if (!this.waStarted) this.initWa()
     } else {
@@ -218,6 +277,116 @@ export class ConnectorSession {
     } catch (err) {
       this.log.warn({ err }, '[hub] DeclareHosted failed — session will not be swept for idleness')
     }
+  }
+
+  /**
+   * Tell Messenger-BE this build understands voice notes, so it may push spoken answers here.
+   *
+   * It has to be declared. SignalR resolves client methods by name, so a `SendAudioMessage` push
+   * to a connector with no handler for it is accepted and then dropped in complete silence — the
+   * server would record a voice note it never sent, and the user would be left waiting for it.
+   *
+   * Re-declared on every reconnect for the same reason as `declareHosted`: the server holds this in
+   * memory, so a transport blip or a deployment loses it. Losing it is safe — the channel falls
+   * back to text-only answers — but it stays lost until something says otherwise.
+   *
+   * Failure is not fatal. The worst case is a channel that answers in writing only, which is what
+   * every channel did before this existed.
+   */
+  private async declareVoiceSupport(): Promise<void> {
+    if (!this.sessionId) return
+
+    try {
+      await this.connection?.invoke('DeclareVoiceSupport', this.sessionId)
+      this.log.info('[hub] declared voice-note support')
+    } catch (err) {
+      // Expected, and harmless, against a Messenger-BE that predates voice notes: the hub method
+      // does not exist there, so this throws and the channel simply stays text-only.
+      this.log.warn({ err }, '[hub] DeclareVoiceSupport failed — answers will be text only')
+    }
+  }
+
+  /**
+   * Uploads a voice note to Messenger-BE and returns the words it came back with.
+   *
+   * Over HTTP rather than the hub, because Messenger-BE's SignalR runs with the default 32 KB
+   * receive limit and a voice note of any length exceeds it once base64 has added its third.
+   *
+   * The reply also decides whether transcription should have happened at all — `enabled: false`
+   * means this channel is not set up for voice notes, or the note was too long to pay for. Null
+   * either way: the caller drops the message, which is what an untranscribed voice note has always
+   * done.
+   */
+  private async transcribeVoiceNote(
+    audio: Buffer,
+    mimeType: string,
+    seconds: number,
+    messageId: string,
+  ): Promise<string | null> {
+    if (!this.sessionId) return null
+
+    try {
+      const form = new FormData()
+
+      // The extension is what the transcription provider infers the container from, and it rejects
+      // a mismatch outright — so it is derived from what WhatsApp actually said the audio is,
+      // never assumed.
+      form.append('file', new Blob([new Uint8Array(audio)], { type: mimeType }), voiceNoteFileName(mimeType))
+      form.append('messageId', messageId)
+      form.append('seconds', String(seconds))
+
+      const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-audio`, {
+        method: 'POST',
+        body: form,
+      })
+
+      if (!response.ok) {
+        this.log.warn(
+          { status: response.status, messageId, seconds },
+          '[hub] ✖ voice note upload refused — message dropped',
+        )
+
+        return null
+      }
+
+      const result = (await response.json()) as { enabled?: boolean; text?: string; reason?: string }
+
+      if (!result.enabled) {
+        this.log.info(
+          { messageId, seconds, reason: result.reason ?? 'unknown' },
+          '[hub] voice note not transcribed — the channel is not set up for it',
+        )
+
+        return null
+      }
+
+      const text = (result.text ?? '').trim()
+
+      if (!text) {
+        this.log.info({ messageId, seconds }, '[hub] voice note transcribed to nothing — message dropped')
+        return null
+      }
+
+      this.log.info({ messageId, seconds, textLength: text.length }, '[hub] ✔ voice note transcribed')
+
+      return text
+    } catch (err) {
+      this.log.error({ err, messageId, seconds }, '[hub] ✖ voice note transcription failed')
+
+      return null
+    }
+  }
+
+  /**
+   * The HTTP root of the Messenger-BE that serves this session's hub.
+   *
+   * Derived from the hub URL rather than configured separately, so there is exactly one address to
+   * point at an environment — and so a connector aimed at a developer's own machine, a direct App
+   * Service URL, or an APIM front door all reach the matching API without a second setting to keep
+   * in step.
+   */
+  private apiBaseUrl(): string {
+    return this.hubUrl.replace(/\/hubs\/connector\/?$/i, '')
   }
 
   /**
@@ -254,6 +423,7 @@ export class ConnectorSession {
     this.log.info({ sessionId: this.sessionId }, '[hub] paired')
     this.handlers.onRegistered({ sessionId: this.sessionId, agentId: this.agentId, hubUrl: this.hubUrl })
     await this.declareHosted()
+    await this.declareVoiceSupport()
     this.initWa()
   }
 
@@ -314,9 +484,15 @@ export class ConnectorSession {
               isAddressedToBot: msg.isAddressedToBot ?? true,
               mentionsOthers: msg.mentionsOthers ?? false,
               quotedFromAgent: msg.quotedFromAgent ?? false,
+              // The text above is already the transcript. These two only say where it came from,
+              // which is what makes the answer eligible to be spoken back.
+              isVoiceNote: msg.isVoiceNote ?? false,
+              voiceSeconds: msg.voiceSeconds ?? 0,
             })
             .catch((err) => this.log.error({ err }, '[hub] MessageInbound failed'))
         },
+        transcribeVoiceNote: (audio, mimeType, seconds, messageId) =>
+          this.transcribeVoiceNote(audio, mimeType, seconds, messageId),
         onReaction: (reaction) => {
           conn
             ?.invoke('ReactionInbound', {

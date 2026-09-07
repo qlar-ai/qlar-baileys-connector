@@ -2,6 +2,7 @@ import makeWASocket, {
   areJidsSameUser,
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   isJidGroup,
   makeCacheableSignalKeyStore,
@@ -64,12 +65,34 @@ export interface InboundMessage {
    * member. Meaningless when nothing is quoted, and false in that case.
    */
   quotedFromAgent?: boolean
+  /**
+   * True when this arrived as a voice note. `text` is then the transcript, resolved before the
+   * message was forwarded — everything downstream reads an ordinary text message.
+   */
+  isVoiceNote?: boolean
+  /** How long the voice note was, as WhatsApp reported it. Diagnostic only. */
+  voiceSeconds?: number
 }
 
 export type OnQr = (qrBase64: string) => void
 export type OnConnected = (phoneNumber: string) => void
 export type OnDisconnected = (reason: string, shouldReconnect: boolean) => void
 export type OnMessage = (msg: InboundMessage) => void
+
+/**
+ * Turns a downloaded voice note into words, by asking Messenger-BE.
+ *
+ * Passed in rather than done here because only the hub layer knows how to reach Messenger-BE, and
+ * because the answer is not this module's to decide: the reply says whether the channel is even set
+ * up to pay for transcription. Null means "no words" for any reason — a refusal upstream included —
+ * and the message is then dropped, exactly as an untranscribed voice note has always been.
+ */
+export type OnTranscribeVoiceNote = (
+  audio: Buffer,
+  mimeType: string,
+  seconds: number,
+  messageId: string,
+) => Promise<string | null>
 
 // ───────────────────────────────────────────────────────────────────────────
 // Diagnostics
@@ -403,6 +426,9 @@ export async function startWhatsApp(
   onConnected: OnConnected,
   onDisconnected: OnDisconnected,
   onMessage: OnMessage,
+  // Optional, and last, so nothing that calls this without it changes behaviour: voice notes are
+  // then ignored exactly as they were before any of this existed.
+  onTranscribeVoiceNote?: OnTranscribeVoiceNote,
 ): Promise<void> {
   fs.mkdirSync(WA_SESSION_DIR, { recursive: true })
 
@@ -477,7 +503,16 @@ export async function startWhatsApp(
     }
   })
 
-  socket.ev.on('messages.upsert', ({ messages, type }) => {
+  /*
+    Async, so a voice note can be transcribed before the message is forwarded. Awaiting inside the
+    loop keeps the batch in order, which the debounce upstream relies on to gather one person's
+    consecutive messages into a single turn.
+
+    Declared here and subscribed below rather than passed to `on` directly: an async listener that
+    rejects is an unhandled rejection, which modern Node treats as fatal. Handing it over with an
+    explicit catch keeps one malformed message from taking the whole connector down.
+  */
+  const handleUpsert = async ({ messages, type }: { messages: WAMessage[]; type: string }) => {
     // Cache every message (sent + received) so getMessage() can answer retries.
     for (const msg of messages) cacheMessage(msg.key.id, msg.message)
     log.debug({ type, count: messages.length }, '[in] messages.upsert')
@@ -487,17 +522,44 @@ export async function startWhatsApp(
       if (!msg.message || msg.key.fromMe) continue
 
       const from = msg.key.remoteJid ?? ''
+      if (!from) continue
 
       // Baileys fills this from the stanza's addressing context, so for a LID-migrated
       // contact the phone number is right here — see Utils/decode-wa-message.
       const fromAlt = msg.key.remoteJidAlt ?? ''
-      const text =
+      let text =
         msg.message.conversation ??
         msg.message.extendedTextMessage?.text ??
         msg.message.imageMessage?.caption ??
         ''
 
-      if (!text || !from) continue
+      /*
+        A voice note carries no text of any kind, so without this it falls out at the guard below
+        and the sender is answered with silence — which is what happened before this existed.
+
+        The transcript takes the place of the text and nothing downstream is any the wiser, which
+        is deliberate: the addressing rules, the group logic and everything upstream of the agent
+        all work on words, and giving them words is far less fragile than teaching each of them
+        about audio.
+      */
+      const audio = msg.message.audioMessage
+      let isVoiceNote = false
+      let voiceSeconds = 0
+
+      if (!text && audio) {
+        voiceSeconds = audio.seconds ?? 0
+
+        const transcript = await transcribeVoiceNote(msg, audio, voiceSeconds, onTranscribeVoiceNote)
+
+        // No words, for any reason — a refusal upstream, a failed download, a silent recording.
+        // Dropped rather than forwarded empty: an empty turn costs a model call and answers nothing.
+        if (!transcript) continue
+
+        text = transcript
+        isVoiceNote = true
+      }
+
+      if (!text) continue
 
       // Kept before the callback so the reply that follows can quote this exact message.
       cacheQuotable(msg)
@@ -506,7 +568,7 @@ export async function startWhatsApp(
       const isGroup = isJidGroup(from) ?? false
 
       log.info(
-        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
+        { from, fromAlt, messageId: msg.key.id, isGroup, isVoiceNote, voiceSeconds, textPreview: text.slice(0, 120) },
         '[in] ← inbound message forwarded to hub',
       )
 
@@ -530,8 +592,17 @@ export async function startWhatsApp(
         ...(isGroup
           ? readAddressing(contextInfo)
           : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }),
+        // What makes the answer eligible to be spoken. Upstream decides whether it actually is.
+        isVoiceNote,
+        voiceSeconds,
       })
     }
+  }
+
+  socket.ev.on('messages.upsert', (event) => {
+    void handleUpsert(event).catch((err) =>
+      log.error({ err: describeError(err) }, '[in] ✖ inbound batch failed'),
+    )
   })
 
   // Outbound delivery lifecycle — this is WhatsApp telling us what happened to a
@@ -568,6 +639,98 @@ export async function startWhatsApp(
       )
     }
   })
+}
+
+/**
+ * Downloads a voice note and asks the hub layer to turn it into words.
+ *
+ * Returns null for every failure, and the caller drops the message on null. That is the same
+ * outcome a voice note had before any of this existed, which makes every branch here safe: the
+ * worst case is the behaviour being replaced.
+ *
+ * The download is the part most likely to fail — WhatsApp expires media, and a note that sat in a
+ * queue while the connector was restarting may no longer be fetchable. Hence the reupload request,
+ * which is Baileys' own retry for exactly that case.
+ */
+async function transcribeVoiceNote(
+  msg: WAMessage,
+  audio: proto.Message.IAudioMessage,
+  seconds: number,
+  onTranscribeVoiceNote?: OnTranscribeVoiceNote,
+): Promise<string | null> {
+  // No handler means this build was not wired to spend money on audio. Voice notes are then
+  // ignored exactly as they always were.
+  if (!onTranscribeVoiceNote || !activeSocket) return null
+
+  const messageId = msg.key?.id ?? ''
+  const mimeType = audio.mimetype ?? 'audio/ogg'
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: baileysLogger as any,
+        // Bound through an arrow rather than passed by reference: the method reads `this` off the
+        // socket, and handing it over bare loses it.
+        reuploadRequest: (m) => activeSocket!.updateMediaMessage(m),
+      },
+    )
+
+    log.info(
+      { messageId, seconds, bytes: buffer.length, mimeType, ptt: audio.ptt ?? false },
+      '[in] voice note downloaded — asking for a transcript',
+    )
+
+    return await onTranscribeVoiceNote(buffer, mimeType, seconds, messageId)
+  } catch (err) {
+    log.error({ err: describeError(err), messageId, seconds, mimeType }, '[in] ✖ could not download the voice note')
+
+    return null
+  }
+}
+
+/**
+ * Sends a spoken answer as a WhatsApp voice note.
+ *
+ * `ptt: true` is the whole difference between a voice note and a file attachment: the same bytes
+ * without it arrive as a document with a download button. WhatsApp also insists on Ogg/Opus for the
+ * voice-note bubble — anything else degrades to an attachment on some clients and refuses to play on
+ * iOS — so the container is decided upstream, where the audio is generated, and this carries what
+ * it is given.
+ *
+ * No quoting and no mention rewriting, unlike `sendMessage`. A voice note has no text for a mention
+ * to live in, and it follows the written answer it duplicates, which already carries whatever quote
+ * the turn earned.
+ */
+export async function sendAudioMessage(
+  to: string,
+  audioBase64: string,
+  seconds: number,
+  mimeType: string,
+): Promise<void> {
+  if (!activeSocket) {
+    log.error({ to }, '[send] ✖ no active socket — voice note not sent')
+    throw new Error('WhatsApp socket is not connected')
+  }
+
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+  const audio = Buffer.from(audioBase64, 'base64')
+
+  const result = await activeSocket.sendMessage(jid, {
+    audio,
+    mimetype: mimeType || 'audio/ogg; codecs=opus',
+    ptt: true,
+    // Shown on the bubble before the audio is downloaded. Cosmetic, but a duration that disagrees
+    // with what then plays reads as a broken client.
+    seconds,
+  })
+
+  cacheMessage(result?.key?.id, result?.message)
+  if (result) cacheQuotable(result)
+
+  log.info({ jid, seconds, bytes: audio.length, messageId: result?.key?.id }, '[send] ✔ voice note sent')
 }
 
 /**

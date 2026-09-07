@@ -149408,6 +149408,51 @@ var aggregateMessageKeysNotFromMe = (keys) => {
   }
   return Object.values(keyMap);
 };
+var REUPLOAD_REQUIRED_STATUS = [410, 404];
+var downloadMediaMessage = async (message, type, options, ctx) => {
+  const result = await downloadMsg().catch(async (error) => {
+    if (ctx && typeof error?.status === "number" && // treat errors with status as HTTP failures requiring reupload
+    REUPLOAD_REQUIRED_STATUS.includes(error.status)) {
+      ctx.logger.info({ key: message.key }, "sending reupload media request...");
+      message = await ctx.reuploadRequest(message);
+      const result2 = await downloadMsg();
+      return result2;
+    }
+    throw error;
+  });
+  return result;
+  async function downloadMsg() {
+    const mContent = extractMessageContent(message.message);
+    if (!mContent) {
+      throw new import_boom6.Boom("No message present", { statusCode: 400, data: message });
+    }
+    const contentType = getContentType(mContent);
+    let mediaType = contentType?.replace("Message", "");
+    const media = mContent[contentType];
+    if (!media || typeof media !== "object" || !("url" in media) && !("thumbnailDirectPath" in media)) {
+      throw new import_boom6.Boom(`"${contentType}" message is not a media message`);
+    }
+    let download;
+    if ("thumbnailDirectPath" in media && !("url" in media)) {
+      download = {
+        directPath: media.thumbnailDirectPath,
+        mediaKey: media.mediaKey
+      };
+      mediaType = "thumbnail-link";
+    } else {
+      download = media;
+    }
+    const stream2 = await downloadContentFromMessage(download, mediaType, options);
+    if (type === "buffer") {
+      const bufferArray = [];
+      for await (const chunk2 of stream2) {
+        bufferArray.push(chunk2);
+      }
+      return Buffer.concat(bufferArray);
+    }
+    return stream2;
+  }
+};
 var assertMediaContent = (content) => {
   content = extractMessageContent(content);
   const mediaContent = content?.documentMessage || content?.imageMessage || content?.videoMessage || content?.audioMessage || content?.stickerMessage;
@@ -166016,7 +166061,7 @@ function cacheMessage(id, message) {
   messageStore.set(id, message);
 }
 var activeSocket = null;
-async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
+async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage, onTranscribeVoiceNote) {
   fs5.mkdirSync(WA_SESSION_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(WA_SESSION_DIR);
   const { version: version3 } = await fetchLatestBaileysVersion();
@@ -166079,21 +166124,32 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
       onDisconnected(reason, shouldReconnect);
     }
   });
-  socket.ev.on("messages.upsert", ({ messages, type }) => {
+  const handleUpsert = async ({ messages, type }) => {
     for (const msg of messages) cacheMessage(msg.key.id, msg.message);
     log2.debug({ type, count: messages.length }, "[in] messages.upsert");
     if (type !== "notify") return;
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const from = msg.key.remoteJid ?? "";
+      if (!from) continue;
       const fromAlt = msg.key.remoteJidAlt ?? "";
-      const text = msg.message.conversation ?? msg.message.extendedTextMessage?.text ?? msg.message.imageMessage?.caption ?? "";
-      if (!text || !from) continue;
+      let text = msg.message.conversation ?? msg.message.extendedTextMessage?.text ?? msg.message.imageMessage?.caption ?? "";
+      const audio = msg.message.audioMessage;
+      let isVoiceNote = false;
+      let voiceSeconds = 0;
+      if (!text && audio) {
+        voiceSeconds = audio.seconds ?? 0;
+        const transcript = await transcribeVoiceNote(msg, audio, voiceSeconds, onTranscribeVoiceNote);
+        if (!transcript) continue;
+        text = transcript;
+        isVoiceNote = true;
+      }
+      if (!text) continue;
       cacheQuotable(msg);
       const contextInfo = contextInfoOf(msg.message);
       const isGroup = isJidGroup(from) ?? false;
       log2.info(
-        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
+        { from, fromAlt, messageId: msg.key.id, isGroup, isVoiceNote, voiceSeconds, textPreview: text.slice(0, 120) },
         "[in] \u2190 inbound message forwarded to hub"
       );
       rememberName(isGroup ? msg.key.participant : from, msg.pushName);
@@ -166111,9 +166167,17 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
         groupName: isGroup ? groupSubject(from) : "",
         // Individual chats are always addressed to the bot; groups have to earn it. The other two
         // are group-only by nature — in a one-to-one chat there is nobody else to be aiming at.
-        ...isGroup ? readAddressing(contextInfo) : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }
+        ...isGroup ? readAddressing(contextInfo) : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false },
+        // What makes the answer eligible to be spoken. Upstream decides whether it actually is.
+        isVoiceNote,
+        voiceSeconds
       });
     }
+  };
+  socket.ev.on("messages.upsert", (event) => {
+    void handleUpsert(event).catch(
+      (err) => log2.error({ err: describeError(err) }, "[in] \u2716 inbound batch failed")
+    );
   });
   socket.ev.on("messages.update", (updates) => {
     for (const u3 of updates) {
@@ -166143,6 +166207,51 @@ async function startWhatsApp(onQr, onConnected, onDisconnected, onMessage) {
       );
     }
   });
+}
+async function transcribeVoiceNote(msg, audio, seconds, onTranscribeVoiceNote) {
+  if (!onTranscribeVoiceNote || !activeSocket) return null;
+  const messageId = msg.key?.id ?? "";
+  const mimeType = audio.mimetype ?? "audio/ogg";
+  try {
+    const buffer2 = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      {
+        logger: baileysLogger,
+        // Bound through an arrow rather than passed by reference: the method reads `this` off the
+        // socket, and handing it over bare loses it.
+        reuploadRequest: (m) => activeSocket.updateMediaMessage(m)
+      }
+    );
+    log2.info(
+      { messageId, seconds, bytes: buffer2.length, mimeType, ptt: audio.ptt ?? false },
+      "[in] voice note downloaded \u2014 asking for a transcript"
+    );
+    return await onTranscribeVoiceNote(buffer2, mimeType, seconds, messageId);
+  } catch (err) {
+    log2.error({ err: describeError(err), messageId, seconds, mimeType }, "[in] \u2716 could not download the voice note");
+    return null;
+  }
+}
+async function sendAudioMessage(to, audioBase64, seconds, mimeType) {
+  if (!activeSocket) {
+    log2.error({ to }, "[send] \u2716 no active socket \u2014 voice note not sent");
+    throw new Error("WhatsApp socket is not connected");
+  }
+  const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+  const audio = Buffer.from(audioBase64, "base64");
+  const result = await activeSocket.sendMessage(jid, {
+    audio,
+    mimetype: mimeType || "audio/ogg; codecs=opus",
+    ptt: true,
+    // Shown on the bubble before the audio is downloaded. Cosmetic, but a duration that disagrees
+    // with what then plays reads as a broken client.
+    seconds
+  });
+  cacheMessage(result?.key?.id, result?.message);
+  if (result) cacheQuotable(result);
+  log2.info({ jid, seconds, bytes: audio.length, messageId: result?.key?.id }, "[send] \u2714 voice note sent");
 }
 async function sendMessage(to, text, quotedMessageId) {
   const startedAt = Date.now();
@@ -166365,6 +166474,23 @@ function connectToHub(hubUrl2, pairingCode) {
     logger.info({ jid }, "[hub] \u25C0 LeaveGroup command received from Messenger-BE");
     await leaveGroup(jid);
   });
+  connection.on(
+    "SendAudioMessage",
+    async (payload) => {
+      if (!payload?.to || !payload?.audioBase64) return;
+      logger.info({ to: payload.to, seconds: payload.seconds ?? 0 }, "[hub] \u25C0 SendAudioMessage received");
+      try {
+        await sendAudioMessage(
+          payload.to,
+          payload.audioBase64,
+          payload.seconds ?? 0,
+          payload.mimeType ?? "audio/ogg; codecs=opus"
+        );
+      } catch (err) {
+        logger.error({ err, to: payload.to }, "[hub] \u2716 Failed to send the voice note");
+      }
+    }
+  );
   connection.on("GenerateQr", () => {
     logger.info("[hub] GenerateQr command received \u2014 restarting Baileys");
     stopWhatsApp();
@@ -166399,6 +166525,7 @@ async function pair(connection, hubUrl2, code) {
     localSession = { sessionId: result.sessionId, agentId: result.agentId, hubUrl: hubUrl2 };
     saveSession(localSession);
     logger.info("[hub] Paired \u2014 SessionId: %s, AgentId: %s", result.sessionId, result.agentId);
+    await declareVoiceSupport(connection, result.sessionId);
     initWhatsApp(connection, result.sessionId);
   } catch (err) {
     logger.error({ err }, "[hub] Pairing failed \u2014 check the code or try a fresh code from CMS-Web");
@@ -166416,12 +166543,82 @@ async function reconnect(connection) {
   logger.info("[hub] Reconnecting session \u2014 SessionId: %s", session2.sessionId);
   try {
     await connection.invoke("Reconnect", session2.sessionId);
+    await declareVoiceSupport(connection, session2.sessionId);
     await announceWaState(connection);
     if (!waStarted) initWhatsApp(connection, session2.sessionId);
   } catch (err) {
     logger.error({ err }, "[hub] Reconnect failed");
     hubEvents.emit("error", "Reconnect ke Messenger-BE gagal.");
   }
+}
+async function declareVoiceSupport(connection, sessionId) {
+  try {
+    await connection.invoke("DeclareVoiceSupport", sessionId);
+    logger.info("[hub] Declared voice-note support");
+  } catch (err) {
+    logger.warn({ err }, "[hub] DeclareVoiceSupport failed \u2014 answers will be text only");
+  }
+}
+async function transcribeVoiceNote2(sessionId, audio, mimeType, seconds, messageId) {
+  const hubUrl2 = localSession?.hubUrl;
+  if (!hubUrl2) {
+    logger.warn({ messageId }, "[hub] \u2716 no hub URL known \u2014 voice note dropped");
+    return null;
+  }
+  const apiBaseUrl = hubUrl2.replace(/\/hubs\/connector\/?$/i, "");
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([new Uint8Array(audio)], { type: mimeType }), voiceNoteFileName(mimeType));
+    form.append("messageId", messageId);
+    form.append("seconds", String(seconds));
+    const response = await fetch(`${apiBaseUrl}/api/baileys/${sessionId}/inbound-audio`, {
+      method: "POST",
+      body: form
+    });
+    if (!response.ok) {
+      logger.warn(
+        { status: response.status, messageId, seconds },
+        "[hub] \u2716 Voice note upload refused \u2014 message dropped"
+      );
+      return null;
+    }
+    const result = await response.json();
+    if (!result.enabled) {
+      logger.info(
+        { messageId, seconds, reason: result.reason ?? "unknown" },
+        "[hub] Voice note not transcribed \u2014 the channel is not set up for it"
+      );
+      return null;
+    }
+    const text = (result.text ?? "").trim();
+    if (!text) {
+      logger.info({ messageId, seconds }, "[hub] Voice note transcribed to nothing \u2014 message dropped");
+      return null;
+    }
+    logger.info({ messageId, seconds, textLength: text.length }, "[hub] \u2714 Voice note transcribed");
+    return text;
+  } catch (err) {
+    logger.error({ err, messageId, seconds }, "[hub] \u2716 Voice note transcription failed");
+    return null;
+  }
+}
+function voiceNoteFileName(mimeType) {
+  const type = (mimeType || "").split(";")[0].trim().toLowerCase();
+  const extensions2 = {
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "m4a",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/webm": "webm",
+    "audio/amr": "amr"
+  };
+  return `voice-note.${extensions2[type] ?? "ogg"}`;
 }
 async function announceWaState(connection) {
   if (!localSession || !connectedPhoneNumber) return;
@@ -166496,12 +166693,17 @@ function initWhatsApp(connection, sessionId) {
           senderName: msg.senderName ?? "",
           isAddressedToBot: msg.isAddressedToBot ?? true,
           mentionsOthers: msg.mentionsOthers ?? false,
-          quotedFromAgent: msg.quotedFromAgent ?? false
+          quotedFromAgent: msg.quotedFromAgent ?? false,
+          // The text above is already the transcript. These two only say where it came from,
+          // which is what makes the answer eligible to be spoken back.
+          isVoiceNote: msg.isVoiceNote ?? false,
+          voiceSeconds: msg.voiceSeconds ?? 0
         });
       } catch (err) {
         logger.error({ err }, "[hub] Failed to forward inbound message");
       }
-    }
+    },
+    (audio, mimeType, seconds, messageId) => transcribeVoiceNote2(sessionId, audio, mimeType, seconds, messageId)
   ).catch((err) => {
     logger.error({ err }, "[wa] Startup error");
     waStarted = false;
