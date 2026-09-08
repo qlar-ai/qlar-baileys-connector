@@ -2,6 +2,7 @@ import makeWASocket, {
   areJidsSameUser,
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   isJidGroup,
   makeCacheableSignalKeyStore,
@@ -48,12 +49,137 @@ export interface InboundMessage {
    * only the connector knows the bot's own JID and LID.
    */
   isAddressedToBot?: boolean
+  /**
+   * Whether the message @mentions somebody who is not the bot.
+   *
+   * The cheapest possible "this is not for us": an @ of another member is a message aimed at
+   * that member, and knowing so costs nothing and no model call. Resolved here for the same
+   * reason as `isAddressedToBot` — the comparison needs the bot's own JID *and* LID.
+   */
+  mentionsOthers?: boolean
+  /**
+   * When this message quotes another, whether the quoted message was the bot's own.
+   *
+   * Distinct from `quotedMessageId` being present, and the distinction is the whole point: a
+   * reply to the bot is addressed to it, while a reply to another member is addressed to that
+   * member. Meaningless when nothing is quoted, and false in that case.
+   */
+  quotedFromAgent?: boolean
+  /**
+   * True when this arrived as a voice note. `text` is then the transcript, resolved before the
+   * message was forwarded — everything downstream reads an ordinary text message.
+   */
+  isVoiceNote?: boolean
+  /** How long the voice note was, as WhatsApp reported it. Diagnostic only. */
+  voiceSeconds?: number
+  /**
+   * Hosted URLs of the pictures this message carried, empty for a message with none.
+   *
+   * The pictures never travel over the hub. Each one is uploaded before the message is forwarded
+   * and only the URL goes on — the same arrangement a voice note has, where the transcript travels
+   * and the audio does not.
+   *
+   * The one thing this changes for callers is that `text` may be empty on a message that still
+   * deserves an answer: WhatsApp lets somebody send a picture with no caption, and such a message
+   * used to be dropped right here in the connector.
+   */
+  imageUrls?: string[]
+  /**
+   * MIME type of an attachment nobody upstream can show the agent, empty when there is none.
+   *
+   * Set for a video, for a document, and for a picture whose upload was refused — anything, in
+   * other words, that arrived with a caption the agent is about to be handed on its own. Upstream
+   * names it in the turn so the agent can answer the words and admit it could not see the file,
+   * rather than confidently answering about a document that never reached it.
+   *
+   * Empty when the message carried a picture the agent *can* see: that one is in `imageUrls`.
+   */
+  unreadableAttachment?: string
+  /**
+   * The files this message carried, hosted where the agent can read them.
+   *
+   * Only the types the platform can turn into text reach here (PDF, TXT, MD); anything else is an
+   * attachment nobody can read, which is what `unreadableAttachment` is for. Same arrangement as
+   * `imageUrls`: uploaded before the message is submitted, and only the URL travels.
+   */
+  documents?: InboundDocument[]
+}
+
+/**
+ * A file the sender attached, once it has somewhere to live.
+ */
+export interface InboundDocument {
+  url: string
+  /** The name it had on the sender's device, which is what the agent will refer to. */
+  fileName: string
+}
+
+/**
+ * What the upload endpoint needs to know about the message a picture arrived with, so it can
+ * refuse the ones that provably cannot matter — a captionless picture in a room that did not
+ * address the agent will never be answered or recorded, so hosting it buys nothing.
+ */
+export interface InboundImageContext {
+  /** The chat the picture arrived in: a group JID for groups, the sender otherwise. */
+  from: string
+  isGroup: boolean
+  /** Whether the message addresses the agent. Always true in an individual chat. */
+  isAddressedToBot: boolean
+  /** Whether the picture came with a caption. */
+  hasText: boolean
 }
 
 export type OnQr = (qrBase64: string) => void
 export type OnConnected = (phoneNumber: string) => void
 export type OnDisconnected = (reason: string, shouldReconnect: boolean) => void
 export type OnMessage = (msg: InboundMessage) => void
+
+/**
+ * Turns a downloaded voice note into words, by asking Messenger-BE.
+ *
+ * Passed in rather than done here because only the hub layer knows how to reach Messenger-BE, and
+ * because the answer is not this module's to decide: the reply says whether the channel is even set
+ * up to pay for transcription. Null means "no words" for any reason — a refusal upstream included —
+ * and the message is then dropped, exactly as an untranscribed voice note has always been.
+ */
+export type OnTranscribeVoiceNote = (
+  audio: Buffer,
+  mimeType: string,
+  seconds: number,
+  messageId: string,
+) => Promise<string | null>
+
+/**
+ * Puts a downloaded picture somewhere the agent can look at it, by asking Messenger-BE, and
+ * returns the URL.
+ *
+ * Passed in for the same reasons `OnTranscribeVoiceNote` is: only the hub layer knows how to reach
+ * Messenger-BE, and the answer is not this module's to decide — the reply says whether the channel
+ * is set up to pay for the picture at all.
+ *
+ * Null means "no picture the agent can see", for any reason. The message is then forwarded without
+ * it, which leaves a captioned picture answered on its caption and a captionless one dropped:
+ * exactly the behaviour this channel had before.
+ */
+export type OnHostImage = (
+  image: Buffer,
+  mimeType: string,
+  messageId: string,
+  context: InboundImageContext,
+) => Promise<string | null>
+
+/**
+ * The same for a document, and separate from `OnHostImage` because the two are refused for
+ * different reasons and end up as different things: a picture the model looks at, a file whose text
+ * is extracted before any model sees it.
+ */
+export type OnHostDocument = (
+  document: Buffer,
+  mimeType: string,
+  fileName: string,
+  messageId: string,
+  context: InboundImageContext,
+) => Promise<string | null>
 
 // ───────────────────────────────────────────────────────────────────────────
 // Diagnostics
@@ -127,22 +253,177 @@ function cacheQuotable(msg: WAMessage): void {
 // carries no name — never worth blocking message delivery on a metadata round-trip.
 const groupSubjects = new Map<string, string>()
 
+/*
+  Display names, learned as people speak — see the same maps in `server/waSession.ts`.
+
+  WhatsApp does not put names in a message's text. Somebody typing "@Mega Syintia" sends
+  "@270875081363521"; the name is rendered by the reader's own client from `mentionedJid`. Without
+  this, the agent reads an id and repeats it back.
+*/
+const displayNames = new Map<string, string>()
+// The full jid each person was last seen under. A mention must go back out in the domain the room
+// actually uses — a lid room will not resolve an @s.whatsapp.net jid.
+const knownJids = new Map<string, string>()
+
+/** The numeric part of a jid — the form a mention takes inside message text. */
+function jidDigits(jid: string): string {
+  return jid.split('@')[0]?.split(':')[0] ?? ''
+}
+
+/**
+ * Records every member of a group, so a mention does not depend on having heard them speak.
+ *
+ * Names are taken only when WhatsApp supplies one — `notify`/`name` are usually blank in a LID
+ * room unless the person is in your address book. The jid is the part that matters: with it,
+ * "@<id>" in an outgoing message becomes a real mention even for somebody with no name at all,
+ * and a saved contact was never required for that.
+ */
+function rememberParticipants(
+  participants: { id?: string | null; name?: string | null; notify?: string | null }[] | null | undefined,
+): void {
+  if (!participants) return
+
+  for (const p of participants) {
+    const digits = jidDigits(p?.id ?? '')
+    if (!digits) continue
+
+    // Never downgrade a name learned from speech, which is the more current of the two.
+    if (!knownJids.has(digits)) knownJids.set(digits, p.id!)
+
+    const supplied = (p.notify ?? p.name ?? '').trim()
+    if (supplied && !displayNames.has(digits)) displayNames.set(digits, supplied)
+  }
+}
+
+/** Records somebody's display name against the digits of their jid. */
+function rememberName(jid: string | null | undefined, pushName: string | null | undefined): void {
+  if (!jid || !pushName) return
+
+  const digits = jidDigits(jid)
+  if (!digits) return
+
+  displayNames.set(digits, pushName.trim())
+  knownJids.set(digits, jid)
+}
+
+/**
+ * Rewrites "@<id>" in inbound text to "@<display name>".
+ *
+ * Driven by `mentionedJid` rather than by scanning for digit runs, so a price or a year in a
+ * sentence is never mistaken for a mention. An id with no known name is left as it arrived.
+ */
+function namesForIds(text: string, contextInfo: proto.IContextInfo | null | undefined): string {
+  const mentioned = contextInfo?.mentionedJid ?? []
+  if (mentioned.length === 0) return text
+
+  let out = text
+
+  for (const jid of mentioned) {
+    const digits = jidDigits(jid ?? '')
+    if (!digits) continue
+
+    const name = displayNames.get(digits)
+    if (!name) continue
+
+    out = out.split(`@${digits}`).join(`@${name}`)
+  }
+
+  return out
+}
+
+/**
+ * Turns "@<display name>" in an outgoing message back into a real WhatsApp mention.
+ *
+ * Longest name first, so "@Mega Syintia" is not half-matched by a "@Mega" who also exists. An
+ * unresolved name stays plain text: the worst outcome is a mention that does not light up, never
+ * one pointing at the wrong person.
+ */
+function idsForNames(text: string): { text: string; mentions: string[] } {
+  if (!text.includes('@')) return { text, mentions: [] }
+
+  let out = text
+
+  // Names first, longest wins, so "@Mega Syintia" is not half-matched by a "@Mega" who exists.
+  const byLongestName = [...displayNames.entries()].sort(([, a], [, b]) => b.length - a.length)
+
+  for (const [digits, name] of byLongestName) {
+    if (!name) continue
+
+    const needle = `@${name}`
+    if (!out.includes(needle)) continue
+
+    out = out.split(needle).join(`@${digits}`)
+  }
+
+  /*
+    Then collect ids — the same scan for both routes. Names have just become ids above, and an id
+    may also have been written directly, for a member nobody has a name for. Both are the wire form
+    a mention needs, so the cases converge here.
+
+    Only recognised ids are claimed; an unknown one stays plain text.
+  */
+  const mentions = [
+    ...new Set(
+      [...out.matchAll(/@(\d{5,})/g)]
+        .map((m) => m[1]!)
+        .filter((digits) => knownJids.has(digits))
+        .map((digits) => knownJids.get(digits)!),
+    ),
+  ]
+
+  return { text: out, mentions }
+}
+
 /**
  * Returns the cached group subject, kicking off a lookup when it is not known yet.
  * Deliberately non-blocking so later messages cannot overtake earlier ones.
+ *
+ * A failed or empty lookup **forgets the key** rather than caching the empty string, and that is
+ * the whole point of the retry. Reserving the key and leaving it reserved is what made some groups
+ * permanently nameless: the reservation reads as a cached answer, so a lookup that failed once —
+ * because the socket was mid-reconnect, or WhatsApp rate-limited the metadata call — was never
+ * retried for the life of the process, however many messages arrived from that group afterwards.
  */
 function groupSubject(jid: string): string {
   const cached = groupSubjects.get(jid)
 
-  if (cached !== undefined) return cached
+  if (cached) return cached
 
-  // Reserve the key so concurrent messages don't each fire their own lookup.
+  // No socket, no lookup — and crucially no reservation either, or the next message would read
+  // the reservation as a cached answer and never try again.
+  if (!activeSocket) return ''
+
+  // A reservation only while a lookup is genuinely in flight, so concurrent messages from the
+  // same group don't each fire one.
+  if (cached === '') return ''
+
   groupSubjects.set(jid, '')
 
   void activeSocket
-    ?.groupMetadata(jid)
-    .then((meta) => groupSubjects.set(jid, meta?.subject ?? ''))
-    .catch((err) => log.warn({ err, jid }, '[wa] group metadata lookup failed'))
+    .groupMetadata(jid)
+    .then((meta) => {
+      // Free ride on a lookup already happening: participants give us every member's jid whether
+      // they have spoken or not, which is what lets the agent mention somebody silent.
+      rememberParticipants(meta?.participants)
+
+      const subject = meta?.subject ?? ''
+
+      if (subject) {
+        groupSubjects.set(jid, subject)
+        log.info({ jid, subject }, '[wa] group subject resolved')
+        return
+      }
+
+      // Resolved to nothing. Forget it rather than caching the emptiness: a group with a genuinely
+      // blank subject costs one cheap lookup per message, and a group that was renamed after a
+      // blank answer gets its name.
+      groupSubjects.delete(jid)
+    })
+    .catch((err) => {
+      // Dropped so the next message retries. This is the line that was missing.
+      groupSubjects.delete(jid)
+      log.warn({ err, jid }, '[wa] group metadata lookup failed — will retry on the next message')
+    })
 
   return ''
 }
@@ -158,18 +439,132 @@ function groupSubject(jid: string): string {
  * so both are compared. Matching only the phone number would leave the bot deaf in every
  * LID-migrated group.
  */
-function isAddressedToBot(contextInfo: proto.IContextInfo | null | undefined): boolean {
+function readAddressing(
+  contextInfo: proto.IContextInfo | null | undefined,
+): Pick<InboundMessage, 'isAddressedToBot' | 'mentionsOthers' | 'quotedFromAgent'> {
   const me = [activeSocket?.user?.id, activeSocket?.user?.lid].filter(Boolean) as string[]
 
-  if (me.length === 0) return false
+  // No identity yet means no honest answer to any of the three. All false reads upstream as
+  // "unknown", which costs a free negative and never invents one.
+  if (me.length === 0) {
+    return { isAddressedToBot: false, mentionsOthers: false, quotedFromAgent: false }
+  }
+
+  const isMe = (jid: string | null | undefined) =>
+    !!jid && me.some((mine) => areJidsSameUser(jid, mine))
 
   const mentioned = contextInfo?.mentionedJid ?? []
+  const mentionsBot = mentioned.some(isMe)
+  const mentionsOthers = mentioned.some((jid) => !isMe(jid))
 
-  if (mentioned.some((jid) => me.some((mine) => areJidsSameUser(jid, mine)))) return true
-
+  // Present only when something is quoted, and it is the *author* of the quoted message — so
+  // this is "did they reply to us" rather than "did they reply at all".
   const quotedAuthor = contextInfo?.participant
+  const quotedFromAgent = isMe(quotedAuthor)
 
-  return !!quotedAuthor && me.some((mine) => areJidsSameUser(quotedAuthor, mine))
+  return {
+    isAddressedToBot: mentionsBot || quotedFromAgent,
+    mentionsOthers,
+    quotedFromAgent,
+  }
+}
+
+/**
+ * The text of a message, whichever content type happens to carry it.
+ *
+ * Every caption belongs here, including a video's and a document's. This path used to read only
+ * `conversation`, `extendedTextMessage` and an image's caption, which meant somebody who wrote a
+ * sentence under a video was answered with silence.
+ */
+function textOf(message: proto.IMessage | null | undefined): string {
+  if (!message) return ''
+
+  return (
+    message.conversation ??
+    message.extendedTextMessage?.text ??
+    message.imageMessage?.caption ??
+    message.videoMessage?.caption ??
+    message.documentMessage?.caption ??
+    ''
+  )
+}
+
+/**
+ * The picture a message carries, if it carries one the agent could look at.
+ *
+ * A photo sent the ordinary way is an `imageMessage`. A photo sent with WhatsApp's "send as
+ * document" — which people use precisely when the picture matters, because it skips the
+ * re-encoding — is a `documentMessage` whose MIME type happens to be an image, and is just as
+ * readable once downloaded.
+ *
+ * Stickers are deliberately not here. They are decoration with an image's shape: reading one costs
+ * the same image tokens as a photograph and answers a question nobody asked.
+ */
+function imageOf(
+  message: proto.IMessage | null | undefined,
+): { mimeType: string; fileLength: number } | null {
+  if (!message) return null
+
+  const image = message.imageMessage
+
+  if (image) {
+    return { mimeType: image.mimetype ?? 'image/jpeg', fileLength: Number(image.fileLength ?? 0) }
+  }
+
+  const document = message.documentMessage
+  const documentType = document?.mimetype ?? ''
+
+  if (document && documentType.startsWith('image/')) {
+    return { mimeType: documentType, fileLength: Number(document.fileLength ?? 0) }
+  }
+
+  return null
+}
+
+/**
+ * The document a message carries, if it carries one the platform can turn into text.
+ *
+ * Decided on the file name's extension rather than the MIME type, because WhatsApp reports whatever
+ * the sending device felt like — "application/octet-stream" for an ordinary PDF is common — while
+ * the name is both more reliable and the thing the upload actually switches on.
+ *
+ * A document whose MIME type is an image is not here: that is a photo sent the "as document" way,
+ * and `imageOf` has already claimed it.
+ */
+function documentOf(
+  message: proto.IMessage | null | undefined,
+): { mimeType: string; fileName: string; fileLength: number } | null {
+  const document = message?.documentMessage
+
+  if (!document) return null
+  if ((document.mimetype ?? '').startsWith('image/')) return null
+
+  const fileName = document.fileName ?? ''
+  const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+
+  if (extension !== '.pdf' && extension !== '.txt' && extension !== '.md') return null
+
+  return {
+    mimeType: document.mimetype ?? 'application/octet-stream',
+    fileName,
+    fileLength: Number(document.fileLength ?? 0),
+  }
+}
+
+/**
+ * The MIME type of whatever media a message carries, for naming an attachment nobody can read.
+ *
+ * Stickers are left out on purpose: they carry no caption, so there is never a sentence for the
+ * annotation to accompany, and "the sender attached a file" is a poor description of an emoji.
+ */
+function attachmentTypeOf(message: proto.IMessage | null | undefined): string {
+  if (!message) return ''
+
+  if (message.videoMessage) return message.videoMessage.mimetype ?? 'video/mp4'
+  if (message.documentMessage) return message.documentMessage.mimetype ?? 'application/octet-stream'
+  if (message.imageMessage) return message.imageMessage.mimetype ?? 'image/jpeg'
+
+  return ''
 }
 
 /** WhatsApp hangs contextInfo off whichever content type carries the text. */
@@ -216,6 +611,12 @@ export async function startWhatsApp(
   onConnected: OnConnected,
   onDisconnected: OnDisconnected,
   onMessage: OnMessage,
+  // Optional, and last, so nothing that calls this without it changes behaviour: voice notes are
+  // then ignored exactly as they were before any of this existed.
+  onTranscribeVoiceNote?: OnTranscribeVoiceNote,
+  // Likewise optional: without these, pictures and files are ignored the way they always were.
+  onHostImage?: OnHostImage,
+  onHostDocument?: OnHostDocument,
 ): Promise<void> {
   fs.mkdirSync(WA_SESSION_DIR, { recursive: true })
 
@@ -290,7 +691,16 @@ export async function startWhatsApp(
     }
   })
 
-  socket.ev.on('messages.upsert', ({ messages, type }) => {
+  /*
+    Async, so a voice note can be transcribed before the message is forwarded. Awaiting inside the
+    loop keeps the batch in order, which the debounce upstream relies on to gather one person's
+    consecutive messages into a single turn.
+
+    Declared here and subscribed below rather than passed to `on` directly: an async listener that
+    rejects is an unhandled rejection, which modern Node treats as fatal. Handing it over with an
+    explicit catch keeps one malformed message from taking the whole connector down.
+  */
+  const handleUpsert = async ({ messages, type }: { messages: WAMessage[]; type: string }) => {
     // Cache every message (sent + received) so getMessage() can answer retries.
     for (const msg of messages) cacheMessage(msg.key.id, msg.message)
     log.debug({ type, count: messages.length }, '[in] messages.upsert')
@@ -300,33 +710,116 @@ export async function startWhatsApp(
       if (!msg.message || msg.key.fromMe) continue
 
       const from = msg.key.remoteJid ?? ''
+      if (!from) continue
 
       // Baileys fills this from the stanza's addressing context, so for a LID-migrated
       // contact the phone number is right here — see Utils/decode-wa-message.
       const fromAlt = msg.key.remoteJidAlt ?? ''
-      const text =
-        msg.message.conversation ??
-        msg.message.extendedTextMessage?.text ??
-        msg.message.imageMessage?.caption ??
-        ''
+      let text = textOf(msg.message)
 
-      if (!text || !from) continue
+      /*
+        Resolved here rather than at the callback, because the picture upload below needs it: the
+        endpoint refuses a captionless picture that the room never addressed, and only this side
+        knows whether it did.
+      */
+      const contextInfo = contextInfoOf(msg.message)
+      const isGroup = isJidGroup(from) ?? false
+      const addressing = isGroup
+        ? readAddressing(contextInfo)
+        : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }
+
+      /*
+        A voice note carries no text of any kind, so without this it falls out at the guard below
+        and the sender is answered with silence — which is what happened before this existed.
+
+        The transcript takes the place of the text and nothing downstream is any the wiser, which
+        is deliberate: the addressing rules, the group logic and everything upstream of the agent
+        all work on words, and giving them words is far less fragile than teaching each of them
+        about audio.
+      */
+      const audio = msg.message.audioMessage
+      let isVoiceNote = false
+      let voiceSeconds = 0
+
+      if (!text && audio) {
+        voiceSeconds = audio.seconds ?? 0
+
+        const transcript = await transcribeVoiceNote(msg, audio, voiceSeconds, onTranscribeVoiceNote)
+
+        // No words, for any reason — a refusal upstream, a failed download, a silent recording.
+        // Dropped rather than forwarded empty: an empty turn costs a model call and answers nothing.
+        if (!transcript) continue
+
+        text = transcript
+        isVoiceNote = true
+      }
+
+      /*
+        The picture, hosted where the agent can look at it.
+
+        Deliberately not folded into `text` the way a transcript is: a picture is not words, and the
+        model reads it as its own content part. What it shares with the voice note is the ordering —
+        the upload happens before the message is forwarded, so everything upstream handles an
+        ordinary message that carries a URL.
+
+        A caption is left exactly as it arrived. The two cases WhatsApp allows are a picture on its
+        own and a picture with a caption, and both now reach the agent whole; before this, the first
+        was dropped here and the second arrived as text with the picture missing.
+      */
+      const imageUrls = await hostImages(msg, onHostImage, {
+        from,
+        isGroup,
+        // Unknown reads as addressed, which is the safe direction: paying for a picture nothing
+        // reads is a far smaller mistake than dropping one somebody sent us.
+        isAddressedToBot: addressing.isAddressedToBot ?? true,
+        hasText: text.length > 0,
+      })
+
+      /*
+        The document, by the same route and for the same reason as the picture.
+
+        Worth the trip even though the agent never sees the file itself: the platform extracts a
+        PDF's text on upload and hands the agent the words, so "check this invoice" with a PDF
+        attached becomes a question that can actually be answered.
+      */
+      const documents = await hostDocuments(msg, onHostDocument, {
+        from,
+        isGroup,
+        isAddressedToBot: addressing.isAddressedToBot ?? true,
+        hasText: text.length > 0,
+      })
+
+      // Nothing anyone can read. A sticker, a video with no caption, a reaction-shaped stray — and,
+      // when the upload was refused, an attachment with no caption. Dropped rather than forwarded
+      // empty: an empty turn costs a model call and answers nothing.
+      if (!text && imageUrls.length === 0 && documents.length === 0) continue
 
       // Kept before the callback so the reply that follows can quote this exact message.
       cacheQuotable(msg)
 
-      const contextInfo = contextInfoOf(msg.message)
-      const isGroup = isJidGroup(from) ?? false
-
       log.info(
-        { from, fromAlt, messageId: msg.key.id, isGroup, textPreview: text.slice(0, 120) },
+        {
+          from,
+          fromAlt,
+          messageId: msg.key.id,
+          isGroup,
+          isVoiceNote,
+          voiceSeconds,
+          images: imageUrls.length,
+          documents: documents.length,
+          textPreview: text.slice(0, 120),
+        },
         '[in] ← inbound message forwarded to hub',
       )
+
+      // Learned before the text is rewritten, so a message mentioning its own sender resolves too.
+      rememberName(isGroup ? msg.key.participant : from, msg.pushName)
 
       onMessage({
         from,
         fromAlt,
-        text,
+        // Names rather than ids, so the agent reads what a person reads.
+        text: namesForIds(text, contextInfo),
         messageId: msg.key.id ?? '',
         ...readQuoteContext(contextInfo),
         isGroup,
@@ -334,10 +827,26 @@ export async function startWhatsApp(
         senderJid: isGroup ? (msg.key.participant ?? '') : from,
         senderName: msg.pushName ?? '',
         groupName: isGroup ? groupSubject(from) : '',
-        // Individual chats are always addressed to the bot; groups have to earn it.
-        isAddressedToBot: isGroup ? isAddressedToBot(contextInfo) : true,
+        // Individual chats are always addressed to the bot; groups have to earn it. The other two
+        // are group-only by nature — in a one-to-one chat there is nobody else to be aiming at.
+        ...addressing,
+        // What makes the answer eligible to be spoken. Upstream decides whether it actually is.
+        isVoiceNote,
+        voiceSeconds,
+        imageUrls,
+        documents,
+        // Only when nothing was hosted: a picture the agent can see and a file whose text it has are
+        // attachments it was given, not ones it was denied.
+        unreadableAttachment:
+          imageUrls.length > 0 || documents.length > 0 ? '' : attachmentTypeOf(msg.message),
       })
     }
+  }
+
+  socket.ev.on('messages.upsert', (event) => {
+    void handleUpsert(event).catch((err) =>
+      log.error({ err: describeError(err) }, '[in] ✖ inbound batch failed'),
+    )
   })
 
   // Outbound delivery lifecycle — this is WhatsApp telling us what happened to a
@@ -374,6 +883,270 @@ export async function startWhatsApp(
       )
     }
   })
+}
+
+/**
+ * Downloads a voice note and asks the hub layer to turn it into words.
+ *
+ * Returns null for every failure, and the caller drops the message on null. That is the same
+ * outcome a voice note had before any of this existed, which makes every branch here safe: the
+ * worst case is the behaviour being replaced.
+ *
+ * The download is the part most likely to fail — WhatsApp expires media, and a note that sat in a
+ * queue while the connector was restarting may no longer be fetchable. Hence the reupload request,
+ * which is Baileys' own retry for exactly that case.
+ */
+async function transcribeVoiceNote(
+  msg: WAMessage,
+  audio: proto.Message.IAudioMessage,
+  seconds: number,
+  onTranscribeVoiceNote?: OnTranscribeVoiceNote,
+): Promise<string | null> {
+  // No handler means this build was not wired to spend money on audio. Voice notes are then
+  // ignored exactly as they always were.
+  if (!onTranscribeVoiceNote || !activeSocket) return null
+
+  const messageId = msg.key?.id ?? ''
+  const mimeType = audio.mimetype ?? 'audio/ogg'
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: baileysLogger as any,
+        // Bound through an arrow rather than passed by reference: the method reads `this` off the
+        // socket, and handing it over bare loses it.
+        reuploadRequest: (m) => activeSocket!.updateMediaMessage(m),
+      },
+    )
+
+    log.info(
+      { messageId, seconds, bytes: buffer.length, mimeType, ptt: audio.ptt ?? false },
+      '[in] voice note downloaded — asking for a transcript',
+    )
+
+    return await onTranscribeVoiceNote(buffer, mimeType, seconds, messageId)
+  } catch (err) {
+    log.error({ err: describeError(err), messageId, seconds, mimeType }, '[in] ✖ could not download the voice note')
+
+    return null
+  }
+}
+
+/**
+ * Downloads the picture a message carries and asks the hub layer to host it.
+ *
+ * Returns a list because that is what the payload carries, and because WhatsApp will eventually be
+ * able to put more than one picture in a message — a list today costs nothing and saves a protocol
+ * change later. It holds at most one url for now.
+ *
+ * Never throws and never drops the message: an empty list means "this message has no picture the
+ * agent can see", which leaves a captioned picture answered on its caption. That is the behaviour
+ * this channel had before any of this existed, which is what makes every branch here safe.
+ */
+async function hostImages(
+  msg: WAMessage,
+  onHostImage: OnHostImage | undefined,
+  context: InboundImageContext,
+): Promise<string[]> {
+  // No handler means this build was not wired to spend money on pictures. They are then ignored
+  // exactly as they always were.
+  if (!onHostImage || !activeSocket) return []
+
+  const image = imageOf(msg.message)
+
+  if (!image) return []
+
+  const messageId = msg.key?.id ?? ''
+
+  /*
+    Refused before the transfer, not after.
+
+    WhatsApp's own ceiling for a photo, so nothing a client produces reaches it — a phone re-encodes
+    a photo to a couple of megabytes. It bounds the abnormal case, where the alternative is pulling
+    tens of megabytes over the connector's link to have the endpoint refuse it anyway. The endpoint
+    keeps its own, lower cap: this one is the protocol's limit, that one is the deployment's policy.
+  */
+  const maxBytes = 16 * 1024 * 1024
+
+  if (image.fileLength > maxBytes) {
+    log.warn(
+      { messageId, bytes: image.fileLength, mimeType: image.mimeType },
+      '[in] ✖ picture too large to fetch — message forwarded without it',
+    )
+
+    return []
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: baileysLogger as any,
+        // Bound through an arrow rather than passed by reference: the method reads `this` off the
+        // socket, and handing it over bare loses it.
+        reuploadRequest: (m) => activeSocket!.updateMediaMessage(m),
+      },
+    )
+
+    log.info(
+      { messageId, bytes: buffer.length, mimeType: image.mimeType, hasCaption: context.hasText },
+      '[in] picture downloaded — asking for somewhere to put it',
+    )
+
+    const url = await onHostImage(buffer, image.mimeType, messageId, context)
+
+    return url ? [url] : []
+  } catch (err) {
+    log.error(
+      { err: describeError(err), messageId, mimeType: image.mimeType },
+      '[in] ✖ could not download the picture',
+    )
+
+    return []
+  }
+}
+
+/**
+ * Downloads the document a message carries and asks the hub layer to host it.
+ *
+ * Every branch returns an empty list, which reads as "no file the agent can read" and leaves the
+ * message to be answered on its caption with the file named instead — which is what every
+ * attachment on this channel got until now, so nothing here can be worse than what it replaces.
+ */
+async function hostDocuments(
+  msg: WAMessage,
+  onHostDocument: OnHostDocument | undefined,
+  context: InboundImageContext,
+): Promise<InboundDocument[]> {
+  if (!onHostDocument || !activeSocket) return []
+
+  const document = documentOf(msg.message)
+
+  if (!document) return []
+
+  const messageId = msg.key?.id ?? ''
+
+  // Refused before the transfer rather than after, as with a picture. Higher than the picture's
+  // ceiling because a document has no smaller version of itself to send.
+  const maxBytes = 20 * 1024 * 1024
+
+  if (document.fileLength > maxBytes) {
+    log.warn(
+      { messageId, bytes: document.fileLength, fileName: document.fileName },
+      '[in] ✖ document too large to fetch — message forwarded without it',
+    )
+
+    return []
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: baileysLogger as any,
+        reuploadRequest: (m) => activeSocket!.updateMediaMessage(m),
+      },
+    )
+
+    log.info(
+      { messageId, bytes: buffer.length, fileName: document.fileName, hasCaption: context.hasText },
+      '[in] document downloaded — asking for somewhere to put it',
+    )
+
+    const url = await onHostDocument(
+      buffer,
+      document.mimeType,
+      document.fileName,
+      messageId,
+      context,
+    )
+
+    return url ? [{ url, fileName: document.fileName }] : []
+  } catch (err) {
+    log.error(
+      { err: describeError(err), messageId, fileName: document.fileName },
+      '[in] ✖ could not download the document',
+    )
+
+    return []
+  }
+}
+
+/**
+ * Sends a picture, with its description as the caption.
+ *
+ * Baileys is handed the URL rather than the bytes and fetches it itself — which is why a photo never
+ * has to cross the hub, where SignalR's receive limit lives. It also means the fetch happens from
+ * wherever this connector runs, so the address has to be reachable from here; upstream only ever
+ * sends public HTTP addresses for that reason.
+ */
+export async function sendImageMessage(to: string, imageUrl: string, caption: string): Promise<string> {
+  if (!activeSocket) throw new Error('WhatsApp socket is not connected')
+
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+
+  const result = await activeSocket.sendMessage(jid, {
+    image: { url: imageUrl },
+    // Omitted rather than sent empty: an empty caption still gives the bubble a text area on some
+    // clients, which reads as a message that failed to load.
+    ...(caption ? { caption } : {}),
+  })
+
+  cacheMessage(result?.key?.id, result?.message)
+  if (result) cacheQuotable(result)
+
+  log.info({ jid, imageUrl, hasCaption: caption.length > 0 }, '[wa] → picture sent')
+
+  return result?.key?.id ?? ''
+}
+
+/**
+ * Sends a spoken answer as a WhatsApp voice note.
+ *
+ * `ptt: true` is the whole difference between a voice note and a file attachment: the same bytes
+ * without it arrive as a document with a download button. WhatsApp also insists on Ogg/Opus for the
+ * voice-note bubble — anything else degrades to an attachment on some clients and refuses to play on
+ * iOS — so the container is decided upstream, where the audio is generated, and this carries what
+ * it is given.
+ *
+ * No quoting and no mention rewriting, unlike `sendMessage`. A voice note has no text for a mention
+ * to live in, and it follows the written answer it duplicates, which already carries whatever quote
+ * the turn earned.
+ */
+export async function sendAudioMessage(
+  to: string,
+  audioBase64: string,
+  seconds: number,
+  mimeType: string,
+): Promise<void> {
+  if (!activeSocket) {
+    log.error({ to }, '[send] ✖ no active socket — voice note not sent')
+    throw new Error('WhatsApp socket is not connected')
+  }
+
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+  const audio = Buffer.from(audioBase64, 'base64')
+
+  const result = await activeSocket.sendMessage(jid, {
+    audio,
+    mimetype: mimeType || 'audio/ogg; codecs=opus',
+    ptt: true,
+    // Shown on the bubble before the audio is downloaded. Cosmetic, but a duration that disagrees
+    // with what then plays reads as a broken client.
+    seconds,
+  })
+
+  cacheMessage(result?.key?.id, result?.message)
+  if (result) cacheQuotable(result)
+
+  log.info({ jid, seconds, bytes: audio.length, messageId: result?.key?.id }, '[send] ✔ voice note sent')
 }
 
 /**
@@ -439,7 +1212,15 @@ export async function sendMessage(to: string, text: string, quotedMessageId?: st
   )
 
   try {
-    const result = await activeSocket.sendMessage(jid, { text }, quoted ? { quoted } : undefined)
+    // The agent writes "@Mega Syintia"; WhatsApp needs the id in the text plus the jid in
+    // `mentions`, and renders the name back for whoever reads it.
+    const { text: outgoing, mentions } = idsForNames(text)
+
+    const result = await activeSocket.sendMessage(
+      jid,
+      mentions.length > 0 ? { text: outgoing, mentions } : { text: outgoing },
+      quoted ? { quoted } : undefined,
+    )
     cacheMessage(result?.key?.id, result?.message)
     log.info(`test phil ${JSON.stringify(result)}`)
 
@@ -520,6 +1301,41 @@ export async function resolveLid(pn: string): Promise<string | null> {
   } catch (err) {
     log.error({ err, pn: jid }, '[lid] ✖ LID lookup threw')
     return null
+  }
+}
+
+/**
+ * Takes this number out of a group.
+ *
+ * The one action here that cannot be undone from our side: WhatsApp requires a fresh invite from
+ * a member to put the agent back, so nothing upstream may offer a re-join. Leaving itself needs
+ * no admin rights — a member can always walk out.
+ *
+ * Returns whether WhatsApp accepted it, which is not the same as whether Messenger-BE thinks the
+ * agent has left: the policy there is stamped before this command is dispatched, deliberately,
+ * because an offline connector never receives it at all and a record that hides a departure is
+ * worse than one that overstates it.
+ */
+export async function leaveGroup(jid: string): Promise<boolean> {
+  if (!activeSocket) {
+    log.warn({ jid }, '[group] ✖ Cannot leave — WhatsApp socket is not connected')
+    return false
+  }
+
+  // Guarded rather than trusted. `groupLeave` on a non-group id is a malformed stanza sent to
+  // WhatsApp's servers, and this address arrives over the wire from another service.
+  if (!jid.endsWith('@g.us')) {
+    log.warn({ jid }, '[group] ✖ Refusing to leave — not a group address')
+    return false
+  }
+
+  try {
+    await activeSocket.groupLeave(jid)
+    log.info({ jid }, '[group] ✔ Left the group')
+    return true
+  } catch (err) {
+    log.error({ err, jid }, '[group] ✖ groupLeave threw')
+    return false
   }
 }
 
