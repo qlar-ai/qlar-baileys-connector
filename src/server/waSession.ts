@@ -64,6 +64,64 @@ export interface InboundMessage {
   isVoiceNote?: boolean
   /** How long the voice note was, as WhatsApp reported it. Diagnostic only. */
   voiceSeconds?: number
+  /**
+   * Hosted URLs of the pictures this message carried, empty for a message with none.
+   *
+   * The pictures never travel over the hub. Each one is uploaded before the message is submitted
+   * and only the URL is forwarded — the same arrangement a voice note has, where the transcript
+   * travels and the audio does not.
+   *
+   * The one thing this changes for callers is that `text` may be empty on a message that still
+   * deserves an answer: WhatsApp lets somebody send a picture with no caption, and such a message
+   * used to be dropped right here in the connector.
+   */
+  imageUrls?: string[]
+  /**
+   * MIME type of an attachment nobody upstream can show the agent, empty when there is none.
+   *
+   * Set for a video, for a document, and for a picture whose upload was refused — anything, in
+   * other words, that arrived with a caption the agent is about to be handed on its own. Upstream
+   * names it in the turn so the agent can answer the words and admit it could not see the file,
+   * rather than confidently answering about a document that never reached it.
+   *
+   * Empty when the message carried a picture the agent *can* see: that one is in `imageUrls`.
+   */
+  unreadableAttachment?: string
+  /**
+   * The files this message carried, hosted where the agent can read them.
+   *
+   * Only the types the platform can turn into text reach here (PDF, TXT, MD); anything else is an
+   * attachment nobody can read, which is what `unreadableAttachment` is for. Same arrangement as
+   * `imageUrls`: uploaded before the message is submitted, and only the URL travels.
+   */
+  documents?: InboundDocument[]
+}
+
+/**
+ * A file the sender attached, once it has somewhere to live.
+ */
+export interface InboundDocument {
+  url: string
+  /** The name it had on the sender's device, which is what the agent will refer to. */
+  fileName: string
+}
+
+/**
+ * What the upload endpoint needs to know about the message a picture arrived with, so it can
+ * refuse the ones that provably cannot matter — a captionless picture in a room that did not
+ * address the agent will never be answered or recorded, so hosting it buys nothing.
+ *
+ * Passed as an object rather than four more parameters because it is one fact — the shape of the
+ * message — read by one caller.
+ */
+export interface InboundImageContext {
+  /** The chat the picture arrived in: a group JID for groups, the sender otherwise. */
+  from: string
+  isGroup: boolean
+  /** Whether the message addresses the agent. Always true in an individual chat. */
+  isAddressedToBot: boolean
+  /** Whether the picture came with a caption. */
+  hasText: boolean
 }
 
 /**
@@ -126,6 +184,39 @@ export interface WaCallbacks {
     mimeType: string,
     seconds: number,
     messageId: string,
+  ) => Promise<string | null>
+  /**
+   * Puts a downloaded picture somewhere the agent can look at it, by asking Messenger-BE, and
+   * returns the URL.
+   *
+   * On the callback for the same reasons `transcribeVoiceNote` is: only the owning session knows
+   * how to reach Messenger-BE, and the answer is not the connector's to decide — the reply says
+   * whether this channel is set up to pay for the picture at all.
+   *
+   * Null means "no picture the agent can see", for any reason including a deliberate refusal. The
+   * caller then submits the message without it, which leaves a captioned picture answered on its
+   * caption and a captionless one dropped: exactly the behaviour this channel had before.
+   *
+   * Optional, so a session with no interest in media (or a test harness) can omit it and pictures
+   * are ignored as they always were.
+   */
+  hostImage?: (
+    image: Buffer,
+    mimeType: string,
+    messageId: string,
+    context: InboundImageContext,
+  ) => Promise<string | null>
+  /**
+   * The same for a document, and separate from `hostImage` because the two are refused for
+   * different reasons and end up as different things: a picture the model looks at, a file whose
+   * text is extracted before any model sees it.
+   */
+  hostDocument?: (
+    document: Buffer,
+    mimeType: string,
+    fileName: string,
+    messageId: string,
+    context: InboundImageContext,
   ) => Promise<string | null>
 }
 
@@ -420,7 +511,14 @@ export class WaSession {
     return { isAddressedToBot: mentionsBot || quotedFromAgent, mentionsOthers, quotedFromAgent }
   }
 
-  /** The text of a message, whichever content type happens to carry it. */
+  /**
+   * The text of a message, whichever content type happens to carry it.
+   *
+   * Every caption belongs here, including a video's and a document's. The inbound path used to read
+   * only `conversation`, `extendedTextMessage` and an image's caption, which meant somebody who
+   * wrote a sentence under a video was answered with silence — a duplicate of this list is how that
+   * happened, so there is now one list and everything reads it.
+   */
   private static textOf(message: proto.IMessage | null | undefined): string {
     if (!message) return ''
 
@@ -429,8 +527,87 @@ export class WaSession {
       message.extendedTextMessage?.text ??
       message.imageMessage?.caption ??
       message.videoMessage?.caption ??
+      message.documentMessage?.caption ??
       ''
     )
+  }
+
+  /**
+   * The picture a message carries, if it carries one the agent could look at.
+   *
+   * A photo sent the ordinary way is an `imageMessage`. A photo sent with WhatsApp's "send as
+   * document" — which people use precisely when the picture matters, because it skips the
+   * re-encoding — is a `documentMessage` whose MIME type happens to be an image, and is just as
+   * readable once downloaded.
+   *
+   * Stickers are deliberately not here. They are decoration with an image's shape: reading one
+   * costs the same image tokens as a photograph and answers a question nobody asked.
+   */
+  private static imageOf(
+    message: proto.IMessage | null | undefined,
+  ): { mimeType: string; fileLength: number } | null {
+    if (!message) return null
+
+    const image = message.imageMessage
+
+    if (image) {
+      return { mimeType: image.mimetype ?? 'image/jpeg', fileLength: Number(image.fileLength ?? 0) }
+    }
+
+    const document = message.documentMessage
+    const documentType = document?.mimetype ?? ''
+
+    if (document && documentType.startsWith('image/')) {
+      return { mimeType: documentType, fileLength: Number(document.fileLength ?? 0) }
+    }
+
+    return null
+  }
+
+  /**
+   * The document a message carries, if it carries one the platform can turn into text.
+   *
+   * Decided on the file name's extension rather than the MIME type, because WhatsApp reports
+   * whatever the sending device felt like — "application/octet-stream" for an ordinary PDF is
+   * common — while the name is both more reliable and the thing the upload actually switches on.
+   *
+   * A document whose MIME type is an image is not here: that is a photo sent the "as document" way,
+   * and `imageOf` has already claimed it.
+   */
+  private static documentOf(
+    message: proto.IMessage | null | undefined,
+  ): { mimeType: string; fileName: string; fileLength: number } | null {
+    const document = message?.documentMessage
+
+    if (!document) return null
+    if ((document.mimetype ?? '').startsWith('image/')) return null
+
+    const fileName = document.fileName ?? ''
+    const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+
+    if (extension !== '.pdf' && extension !== '.txt' && extension !== '.md') return null
+
+    return {
+      mimeType: document.mimetype ?? 'application/octet-stream',
+      fileName,
+      fileLength: Number(document.fileLength ?? 0),
+    }
+  }
+
+  /**
+   * The MIME type of whatever media a message carries, for naming an attachment nobody can read.
+   *
+   * Stickers are left out on purpose: they carry no caption, so there is never a sentence for the
+   * annotation to accompany, and "the sender attached a file" is a poor description of an emoji.
+   */
+  private static attachmentTypeOf(message: proto.IMessage | null | undefined): string {
+    if (!message) return ''
+
+    if (message.videoMessage) return message.videoMessage.mimetype ?? 'video/mp4'
+    if (message.documentMessage) return message.documentMessage.mimetype ?? 'application/octet-stream'
+    if (message.imageMessage) return message.imageMessage.mimetype ?? 'image/jpeg'
+
+    return ''
   }
 
   /** Whether a JID belongs to this session's own number (phone JID or LID). */
@@ -556,11 +733,18 @@ export class WaSession {
         // Baileys fills this from the stanza's addressing context, so for a LID-migrated contact
         // the phone number is right here — see Utils/decode-wa-message.
         const fromAlt = msg.key.remoteJidAlt ?? ''
-        let text =
-          msg.message.conversation ??
-          msg.message.extendedTextMessage?.text ??
-          msg.message.imageMessage?.caption ??
-          ''
+        let text = WaSession.textOf(msg.message)
+
+        /*
+          Resolved here rather than at the callback, because the picture upload below needs it: the
+          endpoint refuses a captionless picture that the room never addressed, and only this side
+          knows whether it did.
+        */
+        const contextInfo = WaSession.contextInfoOf(msg.message)
+        const isGroup = isJidGroup(from) ?? false
+        const addressing = isGroup
+          ? this.readAddressing(contextInfo)
+          : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }
 
         /*
           A voice note carries no text of any kind, so without this it falls out at the guard below
@@ -590,16 +774,62 @@ export class WaSession {
           isVoiceNote = true
         }
 
-        if (!text) continue
+        /*
+          The picture, hosted where the agent can look at it.
+
+          Deliberately not folded into `text` the way a transcript is: a picture is not words, and
+          the model reads it as its own content part. What it shares with the voice note is the
+          ordering — the upload happens before the message is submitted, so everything upstream
+          handles an ordinary message that carries a URL.
+
+          A caption is left exactly as it arrived. The two cases WhatsApp allows are a picture on
+          its own and a picture with a caption, and both now reach the agent whole; before this,
+          the first was dropped here and the second arrived as text with the picture missing.
+        */
+        const imageUrls = await this.hostImages(msg, cb, {
+          from,
+          isGroup,
+          // Unknown reads as addressed, which is the safe direction: the endpoint's guard exists to
+          // avoid paying for a picture nothing will read, and paying for one is a far smaller
+          // mistake than dropping a picture somebody sent us.
+          isAddressedToBot: addressing.isAddressedToBot ?? true,
+          hasText: text.length > 0,
+        })
+
+        /*
+          The document, by the same route and for the same reason as the picture.
+
+          Worth the trip even though the agent never sees the file itself: the platform extracts a
+          PDF's text on upload and hands the agent the words, so "check this invoice" with a PDF
+          attached becomes a question that can actually be answered.
+        */
+        const documents = await this.hostDocuments(msg, cb, {
+          from,
+          isGroup,
+          isAddressedToBot: addressing.isAddressedToBot ?? true,
+          hasText: text.length > 0,
+        })
+
+        // Nothing anyone can read. A sticker, a video with no caption, a reaction-shaped stray —
+        // and, when the upload was refused, an attachment with no caption. Dropped rather than
+        // forwarded empty: an empty turn costs a model call and answers nothing.
+        if (!text && imageUrls.length === 0 && documents.length === 0) continue
 
         // Kept before the callback so the reply that follows can quote this exact message.
         this.cacheQuotable(msg)
 
-        const contextInfo = WaSession.contextInfoOf(msg.message)
-        const isGroup = isJidGroup(from) ?? false
-
         this.log.info(
-          { from, fromAlt, messageId: msg.key.id, isGroup, isVoiceNote, voiceSeconds, textPreview: text.slice(0, 120) },
+          {
+            from,
+            fromAlt,
+            messageId: msg.key.id,
+            isGroup,
+            isVoiceNote,
+            voiceSeconds,
+            images: imageUrls.length,
+            documents: documents.length,
+            textPreview: text.slice(0, 120),
+          },
           '[in] ← inbound message forwarded to hub',
         )
 
@@ -623,12 +853,18 @@ export class WaSession {
           groupName: isGroup ? this.groupSubject(from) : '',
           // Individual chats are always addressed to the bot; groups have to earn it. The other
           // two are group-only by nature — in a one-to-one chat there is nobody else to aim at.
-          ...(isGroup
-            ? this.readAddressing(contextInfo)
-            : { isAddressedToBot: true, mentionsOthers: false, quotedFromAgent: false }),
+          ...addressing,
           // What makes the answer eligible to be spoken. Upstream decides whether it actually is.
           isVoiceNote,
           voiceSeconds,
+          imageUrls,
+          documents,
+          // Only when nothing was hosted: a picture the agent can see and a file whose text it has
+          // are attachments it was given, not ones it was denied.
+          unreadableAttachment:
+            imageUrls.length > 0 || documents.length > 0
+              ? ''
+              : WaSession.attachmentTypeOf(msg.message),
         })
       }
     }
@@ -738,6 +974,34 @@ export class WaSession {
    * mention to live in, and it follows the written answer it duplicates, which already carries
    * whatever quote the turn earned.
    */
+  /**
+   * Sends a picture, with its description as the caption.
+   *
+   * Baileys is handed the URL rather than the bytes and fetches it itself — which is why a photo
+   * never has to cross the hub, where SignalR's receive limit lives. It also means the fetch happens
+   * from wherever this connector runs, so the address has to be reachable from here; upstream only
+   * ever sends public HTTP addresses for that reason.
+   */
+  async sendImageMessage(to: string, imageUrl: string, caption: string): Promise<string> {
+    if (!this.socket) throw new Error('WhatsApp socket is not connected')
+
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+
+    const result = await this.socket.sendMessage(jid, {
+      image: { url: imageUrl },
+      // Omitted rather than sent empty: an empty caption still gives the bubble a text area on some
+      // clients, which reads as a message that failed to load.
+      ...(caption ? { caption } : {}),
+    })
+
+    this.cache(result?.key?.id, result?.message)
+    if (result) this.cacheQuotable(result)
+
+    this.log.info({ jid, imageUrl, hasCaption: caption.length > 0 }, '[wa] → picture sent')
+
+    return result?.key?.id ?? ''
+  }
+
   async sendAudioMessage(
     to: string,
     audioBase64: string,
@@ -813,6 +1077,152 @@ export class WaSession {
       this.log.error({ err, messageId, seconds, mimeType }, '[in] ✖ could not download the voice note')
 
       return null
+    }
+  }
+
+  /**
+   * Downloads the picture a message carries and asks upstream to host it.
+   *
+   * Returns a list because that is what the payload carries, and because WhatsApp will eventually
+   * be able to put more than one picture in a message — a list today costs nothing and saves a
+   * protocol change later. It holds at most one url for now.
+   *
+   * Never throws and never drops the message: an empty list means "this message has no picture the
+   * agent can see", which leaves a captioned picture answered on its caption. That is the
+   * behaviour this channel had before any of this existed, which is what makes every branch here
+   * safe.
+   */
+  private async hostImages(
+    msg: WAMessage,
+    cb: WaCallbacks,
+    context: InboundImageContext,
+  ): Promise<string[]> {
+    // No handler means this session was not built to spend money on pictures. They are then
+    // ignored exactly as they always were.
+    if (!cb.hostImage) return []
+
+    const image = WaSession.imageOf(msg.message)
+
+    if (!image) return []
+
+    const messageId = msg.key?.id ?? ''
+
+    /*
+      Refused before the transfer, not after.
+
+      WhatsApp's own ceiling for a photo, so nothing a client produces reaches it — a phone
+      re-encodes a photo to a couple of megabytes. It bounds the abnormal case, where the
+      alternative is pulling tens of megabytes over the connector's link to have the endpoint
+      refuse it anyway. The endpoint keeps its own, lower cap: this one is the protocol's limit,
+      that one is the deployment's policy.
+    */
+    const maxBytes = 16 * 1024 * 1024
+
+    if (image.fileLength > maxBytes) {
+      this.log.warn(
+        { messageId, bytes: image.fileLength, mimeType: image.mimeType },
+        '[in] ✖ picture too large to fetch — message forwarded without it',
+      )
+
+      return []
+    }
+
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: this.baileysLogger,
+          // Bound through an arrow rather than passed by reference: the method reads `this` off the
+          // socket, and handing it over bare loses it.
+          reuploadRequest: (m) => this.socket!.updateMediaMessage(m),
+        },
+      )
+
+      this.log.info(
+        { messageId, bytes: buffer.length, mimeType: image.mimeType, hasCaption: context.hasText },
+        '[in] picture downloaded — asking for somewhere to put it',
+      )
+
+      const url = await cb.hostImage(buffer, image.mimeType, messageId, context)
+
+      return url ? [url] : []
+    } catch (err) {
+      this.log.error(
+        { err, messageId, mimeType: image.mimeType },
+        '[in] ✖ could not download the picture',
+      )
+
+      return []
+    }
+  }
+
+  /**
+   * Downloads the document a message carries and asks upstream to host it.
+   *
+   * Every branch returns an empty list, which reads as "no file the agent can read" and leaves the
+   * message to be answered on its caption with the file named instead — which is what every
+   * attachment on this channel got until now, so nothing here can be worse than what it replaces.
+   */
+  private async hostDocuments(
+    msg: WAMessage,
+    cb: WaCallbacks,
+    context: InboundImageContext,
+  ): Promise<InboundDocument[]> {
+    if (!cb.hostDocument) return []
+
+    const document = WaSession.documentOf(msg.message)
+
+    if (!document) return []
+
+    const messageId = msg.key?.id ?? ''
+
+    // Refused before the transfer rather than after, as with a picture. Higher than the picture's
+    // ceiling because a document has no smaller version of itself to send.
+    const maxBytes = 20 * 1024 * 1024
+
+    if (document.fileLength > maxBytes) {
+      this.log.warn(
+        { messageId, bytes: document.fileLength, fileName: document.fileName },
+        '[in] ✖ document too large to fetch — message forwarded without it',
+      )
+
+      return []
+    }
+
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: this.baileysLogger,
+          reuploadRequest: (m) => this.socket!.updateMediaMessage(m),
+        },
+      )
+
+      this.log.info(
+        { messageId, bytes: buffer.length, fileName: document.fileName, hasCaption: context.hasText },
+        '[in] document downloaded — asking for somewhere to put it',
+      )
+
+      const url = await cb.hostDocument(
+        buffer,
+        document.mimeType,
+        document.fileName,
+        messageId,
+        context,
+      )
+
+      return url ? [{ url, fileName: document.fileName }] : []
+    } catch (err) {
+      this.log.error(
+        { err, messageId, fileName: document.fileName },
+        '[in] ✖ could not download the document',
+      )
+
+      return []
     }
   }
 

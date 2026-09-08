@@ -2,7 +2,17 @@ import { EventEmitter } from 'events'
 import * as signalR from '@microsoft/signalr'
 import pino from 'pino'
 import { loadSession, saveSession, clearSession, LocalSession } from './session'
-import { startWhatsApp, sendMessage, sendAudioMessage, logout, stopWhatsApp, resolveLid, leaveGroup } from './whatsapp'
+import {
+  startWhatsApp,
+  sendMessage,
+  sendAudioMessage,
+  sendImageMessage,
+  logout,
+  stopWhatsApp,
+  resolveLid,
+  leaveGroup,
+  InboundImageContext,
+} from './whatsapp'
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -143,6 +153,34 @@ export function connectToHub(hubUrl: string, pairingCode?: string): void {
     so a failure costs the spoken copy of something the user already has, and there is no id
     upstream needs — a reaction on a voice note is not something the agent can answer.
   */
+  /*
+    A picture, to be delivered as a WhatsApp image message.
+
+    Its own client method for the same reason SendAudioMessage is, and the server only pushes it
+    after DeclareImageSupport — a connector without this handler would accept the push and drop it.
+  */
+  connection.on(
+    'SendImageMessage',
+    async (payload: { to: string; imageUrl: string; caption?: string; clientMessageId?: string }) => {
+      if (!payload?.to || !payload?.imageUrl) {
+        logger.warn({ payload }, '[hub] ✖ SendImageMessage payload missing "to"/"imageUrl" — aborting')
+        return
+      }
+
+      logger.info({ to: payload.to, imageUrl: payload.imageUrl }, '[hub] ◀ SendImageMessage received')
+
+      try {
+        const waMessageId = await sendImageMessage(payload.to, payload.imageUrl, payload.caption ?? '')
+
+        if (waMessageId && payload.clientMessageId) {
+          await connection.invoke('MessageSent', localSession?.sessionId ?? '', payload.clientMessageId, waMessageId)
+        }
+      } catch (err) {
+        logger.error({ err, to: payload.to }, '[hub] ✖ send picture failed')
+      }
+    },
+  )
+
   connection.on(
     'SendAudioMessage',
     async (payload: { to: string; audioBase64: string; seconds?: number; mimeType?: string }) => {
@@ -206,6 +244,7 @@ async function pair(
     saveSession(localSession)
     logger.info('[hub] Paired — SessionId: %s, AgentId: %s', result.sessionId, result.agentId)
     await declareVoiceSupport(connection, result.sessionId)
+    await declareImageSupport(connection, result.sessionId)
     initWhatsApp(connection, result.sessionId)
   } catch (err) {
     logger.error({ err }, '[hub] Pairing failed — check the code or try a fresh code from CMS-Web')
@@ -227,6 +266,7 @@ async function reconnect(connection: signalR.HubConnection): Promise<void> {
     // Re-declared on every reconnect, not just at startup: Messenger-BE holds this in memory, so a
     // transport blip or a deployment loses it and the channel silently drops back to text-only.
     await declareVoiceSupport(connection, session.sessionId)
+    await declareImageSupport(connection, session.sessionId)
     await announceWaState(connection)
     if (!waStarted) initWhatsApp(connection, session.sessionId)
   } catch (err) {
@@ -256,6 +296,24 @@ async function declareVoiceSupport(connection: signalR.HubConnection, sessionId:
     logger.info('[hub] Declared voice-note support')
   } catch (err) {
     logger.warn({ err }, '[hub] DeclareVoiceSupport failed — answers will be text only')
+  }
+}
+
+/**
+ * Tell Messenger-BE this build can send a picture, so it may push one here.
+ *
+ * Declared for the same reason voice support is: SignalR resolves client methods by name, so a
+ * `SendImageMessage` push to a connector with no handler for it is accepted and then dropped in
+ * silence. Without this the server keeps doing what it always did — sending the picture's URL as
+ * text, which at least arrives.
+ */
+async function declareImageSupport(connection: signalR.HubConnection, sessionId: string): Promise<void> {
+  try {
+    await connection.invoke('DeclareImageSupport', sessionId)
+    logger.info('[hub] declared picture support')
+  } catch (err) {
+    // Expected, and harmless, against a Messenger-BE that predates outbound pictures.
+    logger.warn({ err }, '[hub] DeclareImageSupport failed — pictures will be sent as links')
   }
 }
 
@@ -368,6 +426,195 @@ function voiceNoteFileName(mimeType: string): string {
 }
 
 /**
+ * A file name whose extension matches the picture, because Dialog-BE reads the MIME type back off
+ * the stored file's extension when it builds the model's content part — a picture stored under the
+ * wrong one arrives as an unreadable attachment rather than as something to look at.
+ *
+ * Falls back to `.jpg`, which is what a WhatsApp photo almost always is.
+ */
+function imageFileName(mimeType: string): string {
+  const type = (mimeType || '').split(';')[0].trim().toLowerCase()
+
+  const extensions: Record<string, string> = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/bmp': 'bmp',
+    'image/heic': 'heic',
+    'image/heif': 'heif',
+  }
+
+  return `image.${extensions[type] ?? 'jpg'}`
+}
+
+/**
+ * Uploads a picture to Messenger-BE and returns the URL it can be read from.
+ *
+ * Over HTTP rather than the hub, for the same reason the voice note is: Messenger-BE's SignalR runs
+ * with the default 32 KB receive limit, which a photo clears several times over.
+ *
+ * The reply also decides whether the picture should have been processed at all — `enabled: false`
+ * means this deployment has pictures switched off, the picture was too large, or it was captionless
+ * chatter in a room that never addressed the agent. Null in every such case, and the caller then
+ * forwards the message without it.
+ */
+async function hostDocument(
+  sessionId: string,
+  document: Buffer,
+  mimeType: string,
+  fileName: string,
+  messageId: string,
+  context: InboundImageContext,
+): Promise<string | null> {
+  const hubUrl = localSession?.hubUrl
+
+  if (!hubUrl) {
+    logger.warn({ messageId }, '[hub] ✖ no hub URL known — document dropped')
+    return null
+  }
+
+  const apiBaseUrl = hubUrl.replace(/\/hubs\/connector\/?$/i, '')
+
+  try {
+    const form = new FormData()
+
+    form.append('file', new Blob([new Uint8Array(document)], { type: mimeType }), fileName || 'document.pdf')
+    form.append('messageId', messageId)
+    // The sender's own name for the file: the extension decides how it is processed, and the name is
+    // what the agent will call it when it answers.
+    form.append('fileName', fileName)
+    form.append('from', context.from)
+    form.append('isGroup', String(context.isGroup))
+    form.append('isAddressedToBot', String(context.isAddressedToBot))
+    form.append('hasText', String(context.hasText))
+
+    const response = await fetch(`${apiBaseUrl}/api/baileys/${sessionId}/inbound-document`, {
+      method: 'POST',
+      body: form,
+    })
+
+    if (!response.ok) {
+      logger.warn(
+        { status: response.status, messageId, fileName },
+        '[hub] ✖ Document upload refused — message forwarded without it',
+      )
+
+      return null
+    }
+
+    const result = (await response.json()) as { enabled?: boolean; url?: string; reason?: string }
+
+    if (!result.enabled) {
+      logger.info(
+        { messageId, fileName, reason: result.reason ?? 'unknown' },
+        '[hub] Document not hosted — the channel did not want it',
+      )
+
+      return null
+    }
+
+    const url = (result.url ?? '').trim()
+
+    if (!url) {
+      // Includes the honest failure: a PDF whose text could not be extracted is refused upstream,
+      // and there is nothing in it for the agent to read.
+      logger.warn(
+        { messageId, fileName },
+        '[hub] ✖ Document hosted to nothing — message forwarded without it',
+      )
+
+      return null
+    }
+
+    logger.info({ messageId, fileName, url }, '[hub] ✔ Document hosted')
+
+    return url
+  } catch (err) {
+    logger.error(
+      { err, messageId, fileName },
+      '[hub] ✖ Document upload failed — message forwarded without it',
+    )
+
+    return null
+  }
+}
+
+async function hostImage(
+  sessionId: string,
+  image: Buffer,
+  mimeType: string,
+  messageId: string,
+  context: InboundImageContext,
+): Promise<string | null> {
+  const hubUrl = localSession?.hubUrl
+
+  if (!hubUrl) {
+    logger.warn({ messageId }, '[hub] ✖ no hub URL known — picture dropped')
+    return null
+  }
+
+  // Derived from the hub URL rather than configured separately, so there is exactly one address to
+  // point at an environment and no second setting to keep in step.
+  const apiBaseUrl = hubUrl.replace(/\/hubs\/connector\/?$/i, '')
+
+  try {
+    const form = new FormData()
+
+    form.append('file', new Blob([new Uint8Array(image)], { type: mimeType }), imageFileName(mimeType))
+    form.append('messageId', messageId)
+    // The sender, so Dialog-BE can bill the guardrail check it runs on this picture to the
+    // conversation it belongs to.
+    form.append('from', context.from)
+    // What the endpoint's cost guard reads. Only this side knows whether the room addressed us.
+    form.append('isGroup', String(context.isGroup))
+    form.append('isAddressedToBot', String(context.isAddressedToBot))
+    form.append('hasText', String(context.hasText))
+
+    const response = await fetch(`${apiBaseUrl}/api/baileys/${sessionId}/inbound-image`, {
+      method: 'POST',
+      body: form,
+    })
+
+    if (!response.ok) {
+      logger.warn(
+        { status: response.status, messageId },
+        '[hub] ✖ Picture upload refused — message forwarded without it',
+      )
+
+      return null
+    }
+
+    const result = (await response.json()) as { enabled?: boolean; url?: string; reason?: string }
+
+    if (!result.enabled) {
+      logger.info(
+        { messageId, reason: result.reason ?? 'unknown' },
+        '[hub] Picture not hosted — the channel did not want it',
+      )
+
+      return null
+    }
+
+    const url = (result.url ?? '').trim()
+
+    if (!url) {
+      logger.warn({ messageId }, '[hub] ✖ Picture hosted to nothing — message forwarded without it')
+      return null
+    }
+
+    logger.info({ messageId, url }, '[hub] ✔ Picture hosted')
+
+    return url
+  } catch (err) {
+    logger.error({ err, messageId }, '[hub] ✖ Picture upload failed — message forwarded without it')
+
+    return null
+  }
+}
+
+/**
  * Re-report the live WhatsApp link to Messenger-BE after (re)attaching to the hub.
  *
  * Messenger-BE holds connector state in an in-memory registry, so every restart — i.e. every
@@ -455,6 +702,12 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
           // which is what makes the answer eligible to be spoken back.
           isVoiceNote: msg.isVoiceNote ?? false,
           voiceSeconds: msg.voiceSeconds ?? 0,
+          // Already hosted, so this is a list of URLs rather than the pictures themselves. A server
+          // predating the field ignores it, and the message reads as text-only — which for a
+          // captioned picture is exactly what it used to be.
+          imageUrls: msg.imageUrls ?? [],
+          documents: msg.documents ?? [],
+          unreadableAttachment: msg.unreadableAttachment ?? '',
         })
       } catch (err) {
         logger.error({ err }, '[hub] Failed to forward inbound message')
@@ -462,6 +715,9 @@ function initWhatsApp(connection: signalR.HubConnection, sessionId: string): voi
     },
     (audio, mimeType, seconds, messageId) =>
       transcribeVoiceNote(sessionId, audio, mimeType, seconds, messageId),
+    (image, mimeType, messageId, context) => hostImage(sessionId, image, mimeType, messageId, context),
+    (document, mimeType, fileName, messageId, context) =>
+      hostDocument(sessionId, document, mimeType, fileName, messageId, context),
   ).catch((err) => {
     logger.error({ err }, '[wa] Startup error')
     waStarted = false
