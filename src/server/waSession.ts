@@ -135,6 +135,14 @@ export interface InboundImageContext {
 export interface InboundReaction {
   /** The chat the reaction happened in — a group JID for groups, the user otherwise. */
   from: string
+  /**
+   * The same contact's phone JID when `from` is a LID, exactly as `InboundMessage.fromAlt`.
+   *
+   * Carried for one reason: upstream keys a contact by their number, and a reaction that
+   * arrived without one would be filed under the LID instead — splitting one person into two
+   * the moment they answer with an emoji rather than words.
+   */
+  fromAlt?: string
   /** The emoji. Empty when the user REMOVED their reaction. */
   emoji: string
   /** Id of the message being reacted to. */
@@ -890,6 +898,8 @@ export class WaSession {
 
         const reaction: InboundReaction = {
           from,
+          // Read off the chat key, the same place and the same way the message path reads it.
+          fromAlt: ev.key?.remoteJidAlt ?? '',
           emoji: ev.reaction?.text ?? '',
           targetMessageId,
           targetFromMe: ev.key?.fromMe ?? false,

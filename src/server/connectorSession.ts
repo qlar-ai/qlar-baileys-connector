@@ -742,6 +742,7 @@ export class ConnectorSession {
               sessionId,
               agentId: this.agentId,
               from: reaction.from,
+              fromAlt: reaction.fromAlt ?? '',
               emoji: reaction.emoji,
               targetMessageId: reaction.targetMessageId,
               targetFromMe: reaction.targetFromMe,
