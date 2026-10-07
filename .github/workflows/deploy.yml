@@ -93,8 +93,17 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # Read once, before deploying: it decides both whether az waits for the app to start and
+      # whether there is anything to health-check afterwards.
+      - name: Read app state
+        id: app
+        run: echo "state=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query state -o tsv)" >> "$GITHUB_OUTPUT"
+
       # Deploys and restarts once, after Oryx has built. No separate `az webapp restart`: a second
       # restart would drop and reconnect every tenant's WhatsApp socket a second time.
+      #
+      # --track-status only when the app is running: on a stopped app az waits for a startup that
+      # never comes, and sits out the whole timeout although the deployment itself finished.
       - name: Zip deploy
         run: >
           az webapp deploy
@@ -103,15 +112,17 @@ jobs:
           --src-path connector.zip
           --type zip
           --restart true
+          --track-status ${{ steps.app.outputs.state == 'Running' }}
           --timeout 900000
 
       # A stopped app is left stopped — someone stopped it on purpose (dev was, 2026-10-05). The new
       # code is in place and runs on the next start.
       - name: Health check
+        env:
+          STATE: ${{ steps.app.outputs.state }}
         run: |
-          state=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query state -o tsv)
-          if [ "$state" != "Running" ]; then
-            echo "::warning::$APP_NAME is $state — deployed, but not started and not health-checked."
+          if [ "$STATE" != "Running" ]; then
+            echo "::warning::$APP_NAME is $STATE — deployed, but not started and not health-checked."
             exit 0
           fi
 
