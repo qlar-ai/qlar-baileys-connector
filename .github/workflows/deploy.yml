@@ -1,0 +1,133 @@
+# Deploys the hosted multi-session connector server (src/server/main.ts) to Azure App Service.
+#
+#   push to dev  → wap-pusaka-wa-connector-dev   (GitHub environment "development")
+#   push to main → wap-pusaka-wa-connector-prod  (GitHub environment "production")
+#
+# Same mechanics as the manual steps in docs/DEPLOY.md: `git archive` of the commit, zip-deployed,
+# and compiled on Azure by Oryx (SCM_DO_BUILD_DURING_DEPLOYMENT=true). Tenant state lives in
+# /home/data, outside wwwroot, so a deploy does not wipe paired sessions — but the restart does
+# drop and reconnect every WhatsApp socket, which is why only changes to the server's code trigger it.
+#
+# Azure sign-in is OIDC (no stored secret): each environment carries the client id of a managed
+# identity that may deploy to that one app only. SCM basic auth is off on both apps, so a publish
+# profile would not work anyway. One-time setup: docs/DEPLOY.md → "CI/CD (GitHub Actions)".
+
+name: Deploy hosted connector
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".nvmrc"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment per app at a time, and never cancel one halfway: an interrupted zip deploy can
+# leave wwwroot without dist/server/main.js, which takes every tenant down.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and package
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'dev' || github.ref_name == 'main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # The App Service startup command is `node dist/server/main.js`. A commit without the server
+      # sources deploys fine and then drops every tenant — see docs/DEPLOY.md "Check first".
+      - name: Check the hosted server sources are present
+        run: test -f src/server/main.ts || { echo "::error::src/server/main.ts is missing — refusing to deploy"; exit 1; }
+
+      # Oryx compiles again on Azure; this is the same tsc, run here so a type error fails the
+      # pipeline before anything reaches the app.
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # Exactly the committed tree, as the manual deploy ships it: no node_modules, no dist, no
+      # wa_session.
+      - name: Package
+        run: git archive --format=zip -o connector.zip HEAD
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector
+          path: connector.zip
+          retention-days: 7
+
+  deploy:
+    name: Deploy to ${{ github.ref_name == 'main' && 'production' || 'development' }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RESOURCE_GROUP: ${{ github.ref_name == 'main' && 'RG_PROD' || 'RG_DEV' }}
+      APP_NAME: ${{ github.ref_name == 'main' && 'wap-pusaka-wa-connector-prod' || 'wap-pusaka-wa-connector-dev' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Deploys and restarts once, after Oryx has built. No separate `az webapp restart`: a second
+      # restart would drop and reconnect every tenant's WhatsApp socket a second time.
+      - name: Zip deploy
+        run: >
+          az webapp deploy
+          --resource-group "$RESOURCE_GROUP"
+          --name "$APP_NAME"
+          --src-path connector.zip
+          --type zip
+          --restart true
+          --timeout 900000
+
+      # A stopped app is left stopped — someone stopped it on purpose (dev was, 2026-10-05). The new
+      # code is in place and runs on the next start.
+      - name: Health check
+        run: |
+          state=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query state -o tsv)
+          if [ "$state" != "Running" ]; then
+            echo "::warning::$APP_NAME is $state — deployed, but not started and not health-checked."
+            exit 0
+          fi
+
+          host=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query defaultHostName -o tsv)
+
+          # The server opens its port before restoring sessions, so /health answers early;
+          # `sessions` climbs afterwards as tenants reconnect.
+          for attempt in $(seq 1 30); do
+            body=$(curl -fsS --max-time 10 "https://$host/health" || true)
+            if echo "$body" | grep -q '"ok":true'; then
+              echo "Healthy: $body"
+              exit 0
+            fi
+            echo "Attempt $attempt: not healthy yet${body:+ ($body)}"
+            sleep 10
+          done
+
+          echo "::error::$APP_NAME did not report healthy within 5 minutes — check: az webapp log tail -g $RESOURCE_GROUP -n $APP_NAME"
+          exit 1

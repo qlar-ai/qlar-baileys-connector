@@ -36,7 +36,7 @@ Not Docker/ACI — the `Dockerfile` in this repo isn't used yet.
 ## Check first (important)
 
 **1. The branch must contain `src/server/`.**
-Branch `main` is the desktop connector — it has **no** `src/server/main.ts`. Deploy `main` and `dist/server/main.js` won't exist, the startup command fails, and **every tenant drops**.
+`main` did not until PR #3 (2026-10-07) brought the hosted server in; older branches and commits may still lack it. Deploy one without `src/server/main.ts` and `dist/server/main.js` won't exist, the startup command fails, and **every tenant drops**. The CI/CD pipeline refuses such a commit.
 
 ```powershell
 git branch --show-current
@@ -53,7 +53,56 @@ git rev-list --left-right --count origin/<branch>...HEAD   # must be "0  0"
 
 ---
 
-## Deploy
+## CI/CD (GitHub Actions)
+
+`.github/workflows/deploy.yml` deploys automatically — the manual steps below remain for rollbacks and emergencies.
+
+| Merge / push to | Deploys to | GitHub environment |
+|---|---|---|
+| `dev` | `wap-pusaka-wa-connector-dev` | `development` |
+| `main` | `wap-pusaka-wa-connector-prod` | `production` |
+
+It runs only when the server's code changes (`src/**`, `package*.json`, `tsconfig.json`, `.nvmrc`, the workflow itself) — every deploy restarts the app, which drops and reconnects every tenant's WhatsApp socket, so a docs change should not. **Actions → Deploy hosted connector → Run workflow** deploys the chosen branch (`dev` or `main`) on demand.
+
+What it does: `npm ci` + `tsc --noEmit` + a check that `src/server/main.ts` exists → `git archive` → `az webapp deploy --type zip` (Oryx builds on Azure, then one restart) → polls `/health` for up to 5 minutes. A **stopped** app is deployed but left stopped, with a warning instead of a health check.
+
+### Setup (done 2026-10-07)
+
+Azure sign-in is OIDC — no secret is stored in GitHub. SCM basic auth is disabled on both apps, so a publish profile cannot be used. Each environment has its own user-assigned managed identity that may deploy to its own app only.
+
+| | `development` | `production` |
+|---|---|---|
+| Managed identity | `id-github-wa-connector-dev` (RG_DEV) | `id-github-wa-connector-prod` (RG_PROD) |
+| `AZURE_CLIENT_ID` (environment variable) | `a0e08f1d-55f0-4975-9394-d978ff43f2c5` | `eb3a7839-107e-4222-9950-33462893d583` |
+| Role | Website Contributor on `wap-pusaka-wa-connector-dev` | Website Contributor on `wap-pusaka-wa-connector-prod` |
+| Deployment branches | `dev` only | `main` only |
+
+Both environments also carry `AZURE_TENANT_ID` = `0fa1f3f9-1330-425b-876a-9ffe2e503091` and `AZURE_SUBSCRIPTION_ID` = `5b37e938-2a7d-4b6a-96b6-c2110cd12aaf` — as *variables*, not secrets: they are identifiers, not credentials. Production has no required reviewers; add them under Settings → Environments → production if PROD deploys should wait for an approval.
+
+**The OIDC subject.** This repo uses GitHub's *immutable* subject claim, which carries the owner and repo ids:
+
+```
+repo:qlar-ai@332980671/qlar-baileys-connector@1283946688:environment:<development|production>
+```
+
+Each identity has a federated credential for that subject (`github-<env>-immutable`), plus one for the plain form `repo:qlar-ai/qlar-baileys-connector:environment:<env>` (`github-<env>`) in case the setting is switched off. Read the current prefix with:
+
+```bash
+gh api repos/qlar-ai/qlar-baileys-connector/actions/oidc/customization/sub --jq .sub_claim_prefix
+```
+
+If the login step fails with `AADSTS70021: No matching federated identity record found`, the token's subject matches neither — most likely the repo moved to another owner, or was deleted and recreated (new ids). Add a credential for the new subject:
+
+```bash
+# for PROD: RG_PROD, id-github-wa-connector-prod, production
+az identity federated-credential create -g RG_DEV --identity-name id-github-wa-connector-dev -n github-development-<suffix>   --issuer https://token.actions.githubusercontent.com   --subject "<sub_claim_prefix>:environment:development"   --audiences api://AzureADTokenExchange
+```
+
+Recreating an identity from scratch: `az identity create`, then `az role assignment create --assignee-object-id <principalId> --assignee-principal-type ServicePrincipal --role "Website Contributor" --scope <web app id>`, then the federated credential above, and put its `clientId` in that environment's `AZURE_CLIENT_ID`.
+
+---
+
+## Deploy (manual)
 
 ### DEV
 
