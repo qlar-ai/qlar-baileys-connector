@@ -1,7 +1,21 @@
 import * as path from 'path'
 import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
-import { InboundImageContext, WaSession } from './waSession'
+import { DisconnectReason } from '@whiskeysockets/baileys'
+import { InboundImageContext, isLinked, WaSession } from './waSession'
+
+/**
+ * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
+ *
+ * Baileys ends an unscanned QR series with a 408 roughly every three minutes, and every 408 used to
+ * be retried — so a wizard closed halfway left a session generating QRs for nobody until the process
+ * died. One did, for a week. Ten minutes is several QR series: ample for a person holding the phone,
+ * and short enough that an abandoned one is gone before anyone notices it.
+ */
+const UNLINKED_PAIRING_TTL_MS = (() => {
+  const minutes = Number(process.env.UNLINKED_PAIRING_TTL_MINUTES ?? 10)
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 10) * 60_000
+})()
 
 /**
  * A file name whose extension matches the picture, because Dialog-BE reads the MIME type back off
@@ -65,7 +79,7 @@ export interface SessionMeta {
 export interface ConnectorSessionHandlers {
   /** Called once Pair succeeds and the real sessionId/agentId are known. */
   onRegistered: (meta: SessionMeta) => void
-  /** Called when the hub tells this session to log out. */
+  /** Called when the session is finished for good — logged out, or a pairing nobody completed. */
   onClosed: (sessionId: string) => void
 }
 
@@ -85,6 +99,9 @@ export class ConnectorSession {
   private agentId: string
   private waStarted = false
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // When this session started waiting for its first QR scan; null once WhatsApp has linked it,
+  // and for restored sessions, which only come back when they were already linked.
+  private unlinkedSince: number | null = null
   private readonly log: Logger
 
   constructor(
@@ -265,6 +282,8 @@ export class ConnectorSession {
 
     connection.on('GenerateQr', () => {
       this.log.info('[hub] GenerateQr — restarting Baileys')
+      // Somebody asked for a fresh QR, so somebody is waiting to scan it.
+      if (this.unlinkedSince !== null) this.unlinkedSince = Date.now()
       this.wa?.stop()
       this.waStarted = false
       this.initWa()
@@ -657,7 +676,22 @@ export class ConnectorSession {
     await this.declareHosted()
     await this.declareVoiceSupport()
     await this.declareImageSupport()
+    this.unlinkedSince = Date.now()
     this.initWa()
+  }
+
+  /**
+   * Whether this close means the pairing was abandoned: a QR series ran out (408), the session has
+   * never been linked, and it has been waiting longer than {@link UNLINKED_PAIRING_TTL_MS}.
+   *
+   * Only a 408 counts. Right after a scan WhatsApp closes the socket with 515 (restart required)
+   * and Baileys may still be writing the new creds — judging that close by the disk could throw
+   * away a number that was linked a second ago.
+   */
+  private pairingAbandoned(statusCode: number | undefined): boolean {
+    if (this.unlinkedSince === null || statusCode !== DisconnectReason.timedOut) return false
+    if (Date.now() - this.unlinkedSince < UNLINKED_PAIRING_TTL_MS) return false
+    return !isLinked(this.sessionDir())
   }
 
   private initWa(): void {
@@ -679,10 +713,22 @@ export class ConnectorSession {
         },
         onConnected: (phone) => {
           this.log.info({ phone }, '[wa] connected')
+          this.unlinkedSince = null
           conn?.invoke('Connected', sessionId, phone).catch((err) => this.log.error({ err }, '[hub] Connected failed'))
         },
-        onDisconnected: (reason, shouldReconnect) => {
+        onDisconnected: (reason, shouldReconnect, statusCode) => {
           this.waStarted = false
+          if (this.pairingAbandoned(statusCode)) {
+            // Nobody scanned any QR in time — the wizard was closed, or the user paired another
+            // way. Retrying would only keep generating QRs for nobody, and nothing upstream can
+            // clean this up: no channel was ever created for it. Tear it down and let the manager
+            // wipe it, exactly as a logout does.
+            this.log.warn({ minutes: UNLINKED_PAIRING_TTL_MS / 60_000 }, '[wa] QR never scanned — pairing abandoned, removing and wiping session')
+            conn?.invoke('Disconnected', sessionId, 'pairing abandoned (QR never scanned)').catch(() => { /* hub may be offline */ })
+            this.handlers.onClosed(sessionId)
+            void this.stop()
+            return
+          }
           conn?.invoke('Disconnected', sessionId, reason).catch(() => { /* hub may be offline */ })
           if (shouldReconnect) {
             this.reconnectTimer = setTimeout(() => this.initWa(), 5000)

@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import pino, { Logger } from 'pino'
 import { ConnectorSession, SessionMeta } from './connectorSession'
+import { isLinked } from './waSession'
 
 /**
  * Holds every live tenant session in this process, keyed by sessionId. This is
@@ -70,11 +71,11 @@ export class SessionManager {
     this.log.info({ sessionId, total: this.sessions.size }, '[manager] session stopped and revoked')
   }
 
-  /** Hub-initiated logout — session already tore itself down, just clean up. */
+  /** Logout or abandoned pairing — session already tore itself down, just clean up. */
   private remove(sessionId: string): void {
     this.sessions.delete(sessionId)
     this.wipe(sessionId)
-    this.log.info({ sessionId, total: this.sessions.size }, '[manager] session removed (logout)')
+    this.log.info({ sessionId, total: this.sessions.size }, '[manager] session removed')
   }
 
   private wipe(sessionId: string): void {
@@ -92,11 +93,12 @@ export class SessionManager {
       if (this.sessions.has(sessionId)) continue
 
       const metaPath = path.join(this.dataRoot, sessionId, 'meta.json')
-      const waDir = path.join(this.dataRoot, sessionId, 'wa_session')
 
-      // A dir with no meta.json or no WhatsApp creds was never fully paired (or was
+      // A dir with no meta.json or no linked WhatsApp creds was never fully paired (or was
       // half-wiped). Restoring it would spawn an unwatched QR nobody can scan — drop it.
-      if (!fs.existsSync(metaPath) || !fs.existsSync(waDir)) {
+      // isLinked rather than "wa_session exists": that folder is created before the first QR,
+      // so an abandoned pairing leaves an empty one that used to pass this check.
+      if (!fs.existsSync(metaPath) || !isLinked(path.join(this.dataRoot, sessionId))) {
         this.wipe(sessionId)
         this.log.warn({ sessionId }, '[manager] incomplete session on disk — wiped, not restored')
         continue

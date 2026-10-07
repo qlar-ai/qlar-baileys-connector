@@ -172,7 +172,8 @@ export interface InboundReaction {
 export interface WaCallbacks {
   onQr: (qrBase64: string) => void
   onConnected: (phoneNumber: string) => void
-  onDisconnected: (reason: string, shouldReconnect: boolean) => void
+  /** `statusCode` is Baileys' DisconnectReason, when the close carried one. */
+  onDisconnected: (reason: string, shouldReconnect: boolean, statusCode?: number) => void
   onMessage: (msg: InboundMessage) => void
   onReaction: (reaction: InboundReaction) => void
   /**
@@ -226,6 +227,30 @@ export interface WaCallbacks {
     messageId: string,
     context: InboundImageContext,
   ) => Promise<string | null>
+}
+
+/**
+ * Whether a session directory holds credentials WhatsApp actually linked.
+ *
+ * The `wa_session` folder alone proves nothing: `WaSession.start` creates it before the first QR
+ * is shown, so a pairing nobody ever scanned leaves an empty one behind. What only a completed link
+ * writes is `creds.json` carrying `me` — the account WhatsApp accepted this device under.
+ *
+ * An unreadable `creds.json` counts as linked. Everything that reads this answer goes on to discard
+ * the session, and throwing away a real number over a half-written file would cost the customer a
+ * re-pair; keeping a dead one costs a retry.
+ */
+export function isLinked(sessionDir: string): boolean {
+  const credsPath = path.join(sessionDir, 'wa_session', 'creds.json')
+
+  if (!fs.existsSync(credsPath)) return false
+
+  try {
+    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8')) as { me?: { id?: string } }
+    return Boolean(creds.me?.id)
+  } catch {
+    return true
+  }
 }
 
 /**
@@ -715,7 +740,7 @@ export class WaSession {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut
         const reason = shouldReconnect ? `disconnected (code ${statusCode})` : 'logged out'
         this.log.warn({ statusCode, shouldReconnect }, '[wa] connection close')
-        cb.onDisconnected(reason, shouldReconnect)
+        cb.onDisconnected(reason, shouldReconnect, statusCode)
       }
     })
 
