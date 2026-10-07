@@ -116,6 +116,7 @@ Already set on both environments — **no need to touch these** for a normal dep
 | `PORT` | `8080` | `8080` |
 | `LOG_LEVEL` | `info` | `info` |
 | `BAILEYS_LOG_LEVEL` | — | `debug` |
+| `UNLINKED_PAIRING_TTL_MINUTES` | — (default `10`) | — (default `10`) |
 | Startup command | `node dist/server/main.js` | `node dist/server/main.js` |
 | Runtime / AlwaysOn | `NODE|24-lts` / on | `NODE|24-lts` / on |
 
@@ -128,6 +129,12 @@ az webapp config show -g RG_PROD -n wap-pusaka-wa-connector-prod --query "{linux
 ### `CONNECTOR_DATA_DIR=/home/data` — don't change this
 
 The code default is `./data`, which sits inside `wwwroot` — and **zip-deploy replaces all of `wwwroot`**. On the default, every deploy wipes all tenant state and **every number has to re-pair**. `/home/data` is outside `wwwroot`, so sessions survive the deploy.
+
+### `UNLINKED_PAIRING_TTL_MINUTES` — when an unscanned pairing is given up
+
+A hosted pairing whose QR is never scanned (wizard closed, user went the Private route) is torn down and its folder wiped at the first QR expiry (`408`) after this many minutes — a QR series lasts ~3 minutes, so with the default 10 it goes at ~11 minutes. Before this, such a session generated QRs for nobody until the process restarted. Sessions that were ever linked are never affected. Look for `QR never scanned — pairing abandoned` in the logs.
+
+On restore, a session folder without linked credentials (`wa_session/creds.json` carrying `me`) is wiped rather than restarted.
 
 ### `HUB_URL` uses the direct App Service URL
 
