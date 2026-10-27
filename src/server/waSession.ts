@@ -14,6 +14,7 @@ import makeWASocket, {
 import * as fs from 'fs'
 import * as path from 'path'
 import pino, { Logger } from 'pino'
+import { isIgnorableJid } from './guards'
 
 export interface InboundMessage {
   from: string
@@ -762,6 +763,12 @@ export class WaSession {
 
         const from = msg.key.remoteJid ?? ''
         if (!from) continue
+
+        // Status posts, broadcast lists and channels are not conversations; never answer them.
+        if (isIgnorableJid(from)) {
+          this.log.debug({ from }, '[in] ignoring broadcast/status/newsletter')
+          continue
+        }
 
         // Baileys fills this from the stanza's addressing context, so for a LID-migrated contact
         // the phone number is right here — see Utils/decode-wa-message.
