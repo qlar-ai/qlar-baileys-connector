@@ -200,13 +200,18 @@ export class ConnectorSession {
    * skipped with a warning (resolves undefined); errors from the invoke itself propagate to the caller
    * exactly as a direct invoke's would.
    */
-  private async hubInvoke(connection: signalR.HubConnection | null | undefined, method: string, ...args: unknown[]): Promise<unknown> {
-    if (!connection) return undefined
-    if (!(await this.gate.wait(HUB_GATE_TIMEOUT_MS))) {
-      this.log.warn({ method }, '[hub] connection not registered in time - call skipped')
-      return undefined
-    }
-    return connection.invoke(method, ...args)
+  private hubInvoke(connection: signalR.HubConnection | null | undefined, method: string, ...args: unknown[]): Promise<unknown> {
+    if (!connection) return Promise.resolve(undefined)
+    // Synchronous fast path: when already registered the invoke happens in this very tick, so a caller
+    // that follows it with stop() (Disconnected for an abandoned pairing) still sends before teardown.
+    if (this.gate.isOpen) return connection.invoke(method, ...args)
+    return this.gate.wait(HUB_GATE_TIMEOUT_MS).then((open) => {
+      if (!open) {
+        this.log.warn({ method }, '[hub] connection not registered in time - call skipped')
+        return undefined
+      }
+      return connection.invoke(method, ...args)
+    })
   }
 
   /** Header proving ownership of the session on the HTTP upload endpoints, when there is a token. */

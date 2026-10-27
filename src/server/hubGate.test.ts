@@ -33,3 +33,34 @@ test('wait_ManyWaiters_AllReleasedOnOpen', async () => {
   gate.open()
   assert.deepEqual(await Promise.all(waiters), [true, true, true])
 })
+
+test('close_WithPendingWaiter_WaiterTimesOutFalse', async () => {
+  const gate = new HubGate()
+  const waiting = gate.wait(30)
+  gate.close()
+  assert.equal(await waiting, false)
+})
+
+test('wait_TimedOut_WaiterRemovedFromSet', async () => {
+  const gate = new HubGate()
+  await gate.wait(10)
+  assert.equal((gate as unknown as { waiters: Set<unknown> }).waiters.size, 0)
+})
+
+test('open_CalledTwice_IsIdempotent', async () => {
+  const gate = new HubGate()
+  const waiting = gate.wait(1000)
+  gate.open()
+  gate.open()
+  assert.equal(await waiting, true)
+  assert.equal(await gate.wait(10), true)
+})
+
+test('isOpen_ReflectsState', () => {
+  const gate = new HubGate()
+  assert.equal(gate.isOpen, false)
+  gate.open()
+  assert.equal(gate.isOpen, true)
+  gate.close()
+  assert.equal(gate.isOpen, false)
+})

@@ -7,23 +7,28 @@
  * when the transport drops.
  */
 export class HubGate {
-  private isOpen = false
+  private opened = false
   private waiters = new Set<() => void>()
 
+  /** Whether the gate is open right now, for callers that must not defer a call by even a tick. */
+  get isOpen(): boolean {
+    return this.opened
+  }
+
   open(): void {
-    this.isOpen = true
+    this.opened = true
     const released = [...this.waiters]
     this.waiters.clear()
     for (const release of released) release()
   }
 
   close(): void {
-    this.isOpen = false
+    this.opened = false
   }
 
   /** Resolves true as soon as the gate is open (immediately if it already is), false on timeout. */
   wait(timeoutMs: number): Promise<boolean> {
-    if (this.isOpen) return Promise.resolve(true)
+    if (this.opened) return Promise.resolve(true)
 
     return new Promise<boolean>((resolve) => {
       const release = () => {
