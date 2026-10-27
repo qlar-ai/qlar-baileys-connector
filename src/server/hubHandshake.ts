@@ -53,3 +53,35 @@ export async function registerWithHub(
     throw err
   }
 }
+
+export type PostPairResult =
+  | { outcome: 'secured'; token: string }
+  | { outcome: 'unsecured'; reason: 'old-server' }
+  | { outcome: 'unsecured'; reason: 'error'; error: unknown }
+  | { outcome: 'rejected' }
+
+/**
+ * Secure a freshly paired session on the same connection that paired it: generate a token and
+ * present it through `ReconnectSecure`. The server stores the first token it sees for that
+ * connection without looking the account up (it does not exist yet during the wizard).
+ *
+ * Unlike {@link registerWithHub} there is no fallback to `Reconnect` - that would fail with
+ * "account not found" mid-wizard. A server that predates tokens, or any other failure, leaves the
+ * session unsecured and working as before; pairing must never fail because this step did.
+ * Only an explicit "token rejected" is reported as such.
+ */
+export async function secureAfterPair(
+  conn: { invoke: (method: string, ...args: unknown[]) => Promise<unknown> },
+  sessionId: string,
+): Promise<PostPairResult> {
+  const token = newConnectorToken()
+  try {
+    await conn.invoke('ReconnectSecure', sessionId, token)
+    return { outcome: 'secured', token }
+  } catch (err) {
+    const msg = errorMessage(err)
+    if (/token rejected/i.test(msg)) return { outcome: 'rejected' }
+    if (/method does not exist/i.test(msg)) return { outcome: 'unsecured', reason: 'old-server' }
+    return { outcome: 'unsecured', reason: 'error', error: err }
+  }
+}

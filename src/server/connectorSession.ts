@@ -3,7 +3,7 @@ import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
-import { registerWithHub, tokenToPresent } from './hubHandshake'
+import { registerWithHub, secureAfterPair, tokenToPresent } from './hubHandshake'
 
 /**
  * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
@@ -718,17 +718,31 @@ export class ConnectorSession {
     if (!this.connection) throw new Error('connection not initialised')
     if (!this.opts.code) throw new Error('no pairing code and no sessionId')
 
-    const result = await this.connection.invoke<{ sessionId: string; agentId: string; connectorToken?: string | null }>(
-      'Pair',
-      this.opts.code,
-    )
+    const result = await this.connection.invoke<{ sessionId: string; agentId: string }>('Pair', this.opts.code)
     this.sessionId = result.sessionId
     this.agentId = result.agentId
-    // Null when the server's token store was down, absent from a server that predates tokens. Either
-    // way the session pairs without one and registers its own at the first ReconnectSecure.
-    this.connectorToken =
-      typeof result.connectorToken === 'string' && result.connectorToken ? result.connectorToken : undefined
-    this.log.info({ sessionId: this.sessionId, hasToken: this.connectorToken !== undefined }, '[hub] paired')
+
+    // Secure the session on this same connection with a token of our own. Only a successful step
+    // yields a token to persist; an old Messenger-BE or a transient failure leaves the session
+    // unsecured (exactly as before tokens), and only an explicit rejection stops the pairing.
+    const secured = await secureAfterPair(this.connection, this.sessionId)
+    if (secured.outcome === 'rejected') {
+      if (!this.blocked) {
+        this.log.error({ sessionId: this.sessionId }, '[hub] connector token rejected right after pairing - not starting WhatsApp')
+      }
+      this.blocked = true
+      // Thrown so the pairing request reports failure and the manager discards this session; nothing retries.
+      throw new Error('Connector token rejected after pairing')
+    }
+    if (secured.outcome === 'secured') {
+      this.connectorToken = secured.token
+    } else if (secured.reason === 'error') {
+      this.log.warn({ err: secured.error }, '[hub] securing the session after pairing failed - continuing unsecured')
+    } else {
+      this.log.info('[hub] Messenger-BE predates connector tokens - session left unsecured')
+    }
+
+    this.log.info({ sessionId: this.sessionId, secured: this.connectorToken !== undefined }, '[hub] paired')
     this.handlers.onRegistered({
       sessionId: this.sessionId,
       agentId: this.agentId,
