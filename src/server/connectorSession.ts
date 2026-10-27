@@ -5,6 +5,10 @@ import { DisconnectReason } from '@whiskeysockets/baileys'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
 import { afterHandshake, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
 import { resolveSessionDir } from './guards'
+import { HubGate } from './hubGate'
+
+/** How long a hub call waits for the connection to finish registering before it is skipped. */
+const HUB_GATE_TIMEOUT_MS = 30_000
 
 /**
  * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
@@ -121,6 +125,8 @@ export class ConnectorSession {
   private pendingToken: string | undefined
   // Set when the hub rejected our token: the session stays idle (no retry, no WhatsApp) until re-paired.
   private blocked = false
+  // Closed until the connection is registered with the hub (Pair / Reconnect / ReconnectSecure done).
+  private readonly gate = new HubGate()
   private readonly log: Logger
 
   constructor(
@@ -184,7 +190,23 @@ export class ConnectorSession {
       this.pendingToken = undefined
       this.handlers.onToken(sessionId, next.token)
     }
+    this.gate.open()
     return true
+  }
+
+  /**
+   * Invoke a hub method once the connection is registered. Never used for Pair / Reconnect /
+   * ReconnectSecure, which are what open the gate. When the gate does not open in time the call is
+   * skipped with a warning (resolves undefined); errors from the invoke itself propagate to the caller
+   * exactly as a direct invoke's would.
+   */
+  private async hubInvoke(connection: signalR.HubConnection | null | undefined, method: string, ...args: unknown[]): Promise<unknown> {
+    if (!connection) return undefined
+    if (!(await this.gate.wait(HUB_GATE_TIMEOUT_MS))) {
+      this.log.warn({ method }, '[hub] connection not registered in time - call skipped')
+      return undefined
+    }
+    return connection.invoke(method, ...args)
   }
 
   /** Header proving ownership of the session on the HTTP upload endpoints, when there is a token. */
@@ -219,7 +241,7 @@ export class ConnectorSession {
           // failure here costs the ability to answer a reaction, not the answer.
           if (payload.clientMessageId && waMessageId && this.sessionId) {
             try {
-              await connection.invoke('MessageSent', this.sessionId, payload.clientMessageId, waMessageId)
+              await this.hubInvoke(connection, 'MessageSent', this.sessionId, payload.clientMessageId, waMessageId)
             } catch (err) {
               this.log.warn({ err, waMessageId }, '[hub] MessageSent failed — reactions on this message cannot be traced')
             }
@@ -267,7 +289,7 @@ export class ConnectorSession {
           )
 
           if (waMessageId && payload.clientMessageId) {
-            await connection.invoke('MessageSent', this.sessionId, payload.clientMessageId, waMessageId)
+            await this.hubInvoke(connection, 'MessageSent', this.sessionId, payload.clientMessageId, waMessageId)
           }
         } catch (err) {
           this.log.error({ err, to: payload.to, imageUrl: payload.imageUrl }, '[hub] send picture failed')
@@ -327,7 +349,7 @@ export class ConnectorSession {
       // Reported even when nothing was found, so the server can stop asking about a number
       // WhatsApp will not pair — silence here would have it retry on every list load forever.
       try {
-        await connection.invoke('LidResolved', sessionId, pn, lid ?? '')
+        await this.hubInvoke(connection, 'LidResolved', sessionId, pn, lid ?? '')
       } catch (err) {
         this.log.error({ err, pn }, '[hub] ✖ Failed to report the LID lookup result')
       }
@@ -369,6 +391,9 @@ export class ConnectorSession {
       if (id) this.handlers.onClosed(id)
       await this.stop()
     })
+
+    connection.onreconnecting(() => this.gate.close())
+    connection.onclose(() => this.gate.close())
 
     connection.onreconnected(async () => {
       if (!this.sessionId || this.blocked) return
@@ -420,7 +445,7 @@ export class ConnectorSession {
     if (!this.sessionId) return
 
     try {
-      await this.connection?.invoke('DeclareHosted', this.sessionId)
+      await this.hubInvoke(this.connection, 'DeclareHosted', this.sessionId)
       this.log.info('[hub] declared as hosted connector session')
     } catch (err) {
       this.log.warn({ err }, '[hub] DeclareHosted failed — session will not be swept for idleness')
@@ -445,7 +470,7 @@ export class ConnectorSession {
     if (!this.sessionId) return
 
     try {
-      await this.connection?.invoke('DeclareVoiceSupport', this.sessionId)
+      await this.hubInvoke(this.connection, 'DeclareVoiceSupport', this.sessionId)
       this.log.info('[hub] declared voice-note support')
     } catch (err) {
       // Expected, and harmless, against a Messenger-BE that predates voice notes: the hub method
@@ -466,7 +491,7 @@ export class ConnectorSession {
     if (!this.sessionId) return
 
     try {
-      await this.connection?.invoke('DeclareImageSupport', this.sessionId)
+      await this.hubInvoke(this.connection, 'DeclareImageSupport', this.sessionId)
       this.log.info('[hub] declared picture support')
     } catch (err) {
       // Expected, and harmless, against a Messenger-BE that predates outbound pictures: the hub
@@ -733,7 +758,7 @@ export class ConnectorSession {
     if (!this.sessionId || !phone) return
 
     try {
-      await this.connection?.invoke('Connected', this.sessionId, phone)
+      await this.hubInvoke(this.connection, 'Connected', this.sessionId, phone)
       this.log.info({ phone }, '[hub] re-announced WhatsApp link after hub reconnect')
     } catch (err) {
       this.log.error({ err }, '[hub] re-announce of WhatsApp link failed')
@@ -766,6 +791,8 @@ export class ConnectorSession {
       // Thrown so the pairing request reports failure and the manager discards this session; nothing retries.
       throw new Error('Connector token rejected after pairing')
     }
+    // Pair itself registered this connection; a failed secure step does not unregister it.
+    this.gate.open()
     if (secured.outcome === 'secured') {
       this.connectorToken = secured.token
     } else if (secured.reason === 'error') {
@@ -819,12 +846,12 @@ export class ConnectorSession {
     this.wa
       .start({
         onQr: (qr) => {
-          conn?.invoke('QrGenerated', sessionId, qr).catch((err) => this.log.error({ err }, '[hub] QrGenerated failed'))
+          this.hubInvoke(conn, 'QrGenerated', sessionId, qr).catch((err) => this.log.error({ err }, '[hub] QrGenerated failed'))
         },
         onConnected: (phone) => {
           this.log.info({ phone }, '[wa] connected')
           this.unlinkedSince = null
-          conn?.invoke('Connected', sessionId, phone).catch((err) => this.log.error({ err }, '[hub] Connected failed'))
+          this.hubInvoke(conn, 'Connected', sessionId, phone).catch((err) => this.log.error({ err }, '[hub] Connected failed'))
         },
         onDisconnected: (reason, shouldReconnect, statusCode) => {
           this.waStarted = false
@@ -834,12 +861,12 @@ export class ConnectorSession {
             // clean this up: no channel was ever created for it. Tear it down and let the manager
             // wipe it, exactly as a logout does.
             this.log.warn({ minutes: UNLINKED_PAIRING_TTL_MS / 60_000 }, '[wa] QR never scanned — pairing abandoned, removing and wiping session')
-            conn?.invoke('Disconnected', sessionId, 'pairing abandoned (QR never scanned)').catch(() => { /* hub may be offline */ })
+            this.hubInvoke(conn, 'Disconnected', sessionId, 'pairing abandoned (QR never scanned)').catch(() => { /* hub may be offline */ })
             this.handlers.onClosed(sessionId)
             void this.stop()
             return
           }
-          conn?.invoke('Disconnected', sessionId, reason).catch(() => { /* hub may be offline */ })
+          this.hubInvoke(conn, 'Disconnected', sessionId, reason).catch(() => { /* hub may be offline */ })
           if (shouldReconnect) {
             this.reconnectTimer = setTimeout(() => this.initWa(), 5000)
             return
@@ -853,8 +880,8 @@ export class ConnectorSession {
           void this.stop()
         },
         onMessage: (msg) => {
-          conn
-            ?.invoke('MessageInbound', {
+          this
+            .hubInvoke(conn, 'MessageInbound', {
               sessionId,
               agentId: this.agentId,
               from: msg.from,
@@ -893,8 +920,8 @@ export class ConnectorSession {
         hostDocument: (document, mimeType, fileName, messageId, context) =>
           this.hostDocument(document, mimeType, fileName, messageId, context),
         onReaction: (reaction) => {
-          conn
-            ?.invoke('ReactionInbound', {
+          this
+            .hubInvoke(conn, 'ReactionInbound', {
               sessionId,
               agentId: this.agentId,
               from: reaction.from,
