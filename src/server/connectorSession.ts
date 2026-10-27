@@ -416,10 +416,50 @@ export class ConnectorSession {
     connection.onreconnecting(() => { if (connection === this.connection) this.gate.close() })
     connection.onclose(() => { if (connection === this.connection) this.gate.close() })
 
+    // One re-registration loop per session at a time: a second blip while it runs is covered by the
+    // running loop, which only succeeds once the connection is usable again.
+    let reRegistering = false
     connection.onreconnected(async () => {
-      if (!this.sessionId || this.blocked) return
+      if (!this.sessionId || this.blocked || reRegistering) return
+      const sessionId = this.sessionId
+      reRegistering = true
       try {
-        if (!(await this.handshake(connection))) return
+        let accountGone = false
+        // The gate stays closed (onreconnecting closed it) until handshake() succeeds and opens it.
+        const registered = await retryUntil(
+          async () => {
+            try {
+              return await this.handshake(connection)
+            } catch (err) {
+              // Tenant deleted: permanent. Any other failure (Cosmos 429, timeout, hub restarting) retries.
+              if (isAccountGone(err)) {
+                accountGone = true
+                return false
+              }
+              throw err
+            }
+          },
+          {
+            delaysMs: HUB_RETRY_DELAYS_MS,
+            isCancelled: () =>
+              this.cancelled ||
+              this.blocked ||
+              connection !== this.connection ||
+              connection.state === signalR.HubConnectionState.Disconnected,
+            onError: (err, n) =>
+              this.log.warn({ err, attempt: n }, '[hub] re-register after reconnect failed - retrying'),
+          },
+        )
+
+        if (accountGone) {
+          this.log.warn('[hub] account gone after reconnect - closing session')
+          this.handlers.onClosed(sessionId)
+          await this.stop()
+          return
+        }
+        // undefined: cancelled / superseded. false: token rejected (handshake already blocked and stopped it).
+        if (!registered) return
+
         // Re-declared on every reconnect, not just at startup. Messenger-BE drops the
         // session's in-memory status when the connection goes, so a transport blip would
         // otherwise leave it reporting this channel as self-hosted — and the CMS would
@@ -430,6 +470,8 @@ export class ConnectorSession {
         await this.announceWaState()
       } catch (err) {
         this.log.error({ err }, '[hub] re-register after reconnect failed')
+      } finally {
+        reRegistering = false
       }
     })
 
@@ -495,6 +537,8 @@ export class ConnectorSession {
 
     void loop
       .then(() => {
+        // Cancelled before any attempt ran: nobody else would settle it, and restore() is awaiting it.
+        settleFirst()
         if (terminal !== undefined && attemptNo > 1 && this.sessionId) {
           this.log.warn('[hub] account gone while retrying - closing session')
           this.handlers.onClosed(this.sessionId)
