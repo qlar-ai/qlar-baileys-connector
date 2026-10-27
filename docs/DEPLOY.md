@@ -140,14 +140,13 @@ The Oryx build plus session restore takes a while. The server opens its port fir
 # 1. Health check — sessions = how many tenants have reconnected
 curl https://wap-pusaka-wa-connector-prod.azurewebsites.net/health
 
-# 2. Session list
-curl https://wap-pusaka-wa-connector-prod.azurewebsites.net/sessions
-
-# 3. Logs
+# 2. Logs
 az webapp log tail -g RG_PROD -n wap-pusaka-wa-connector-prod
 ```
 
 What to look for in the logs: `[server] starting multi-session connector` (with the right `hubUrl`, `dataDir`, `port`), then `[control] listening on port 8080`.
+
+Note: `GET /sessions` now returns only `{ "count": n }` (no session ids); use `/health` for the count. `DELETE /sessions/:id` requires `Authorization: Bearer <session token>` for sessions that have registered a token (Messenger-BE sends it automatically); orphan clean-up stays via Kudu.
 
 Finally: send and receive one real WhatsApp message through the agent.
 
