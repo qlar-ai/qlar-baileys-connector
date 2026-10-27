@@ -191,24 +191,26 @@ export class SessionManager implements ControlManager {
         )
         session = restored
         this.sessions.set(meta.sessionId, restored)
+        // start() only throws for a permanent answer. A hub that is down is retried by the session itself
+        // in the background, so the session stays in the map (counted, reachable by DELETE) meanwhile.
         await restored.start()
-        this.log.info({ sessionId: meta.sessionId }, '[manager] restored session')
+        this.log.info({ sessionId: meta.sessionId }, '[manager] restore started')
       } catch (err) {
         // Don't leave a dead entry in the map if start() failed, nor its SignalR connection open:
         // left running it would keep auto-reconnecting and re-register on the hub with no WhatsApp behind it.
-        this.sessions.delete(sessionId)
+        if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId)
         if (session) await session.stop().catch(() => { /* ignore */ })
 
         // "Messenger account not found" comes from the hub (HubException) when the
         // account was deleted (e.g. via CMS). This session is permanently dead —
-        // wipe it so it stops failing restore on every boot. Any other error is
-        // treated as transient (hub blip) and kept for a retry next boot.
+        // wipe it so it stops failing restore on every boot. start() throws nothing else that
+        // is transient (those are retried inside the session), so anything else is unexpected.
         const msg = err instanceof Error ? err.message : String(err)
         if (msg.includes('account not found')) {
           this.wipe(sessionId)
           this.log.warn({ sessionId }, '[manager] account gone — wiped orphaned session')
         } else {
-          this.log.error({ err, sessionId }, '[manager] failed to restore session (will retry next boot)')
+          this.log.error({ err, sessionId }, '[manager] failed to restore session (dropped from memory, files kept for the next boot)')
         }
       }
     }

@@ -7,6 +7,15 @@ import { InboundImageContext, isLinked, WaSession } from './waSession'
 import { afterHandshake, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
 import { resolveSessionDir } from './guards'
 import { HubGate } from './hubGate'
+import { retryUntil } from './retry'
+
+/** Pause between attempts to reach the hub for a restored session; the last value repeats until it answers. */
+const HUB_RETRY_DELAYS_MS = [2000, 5000, 10000, 30000, 60000]
+
+/** The hub says the tenant no longer exists (deleted via CMS): permanent, so never worth retrying. */
+function isAccountGone(err: unknown): boolean {
+  return (err instanceof Error ? err.message : String(err)).includes('account not found')
+}
 
 /** How long a hub call waits for the connection to finish registering before it is skipped. */
 const HUB_GATE_TIMEOUT_MS = 30_000
@@ -128,6 +137,8 @@ export class ConnectorSession {
   private pendingToken: string | undefined
   // Set when the hub rejected our token: the session stays idle (no retry, no WhatsApp) until re-paired.
   private blocked = false
+  // Set by stop(): ends any retry loop and keeps a late-finishing attempt from starting WhatsApp.
+  private cancelled = false
   // Closed until the connection is registered with the hub (Pair / Reconnect / ReconnectSecure done).
   private readonly gate = new HubGate()
   private readonly log: Logger
@@ -227,7 +238,8 @@ export class ConnectorSession {
     return path.join(this.dataRoot, this.sessionId)
   }
 
-  async start(): Promise<void> {
+  /** Builds a fresh hub connection with every handler attached, and makes it the current one. */
+  private buildConnection(): signalR.HubConnection {
     const connection = new signalR.HubConnectionBuilder()
       .withUrl(this.hubUrl)
       .withAutomaticReconnect({
@@ -420,20 +432,105 @@ export class ConnectorSession {
       }
     })
 
-    await connection.start()
+    return connection
+  }
 
-    if (this.sessionId) {
-      // Restored session — re-register straight away.
-      if (!(await this.handshake(connection))) return
-      await this.declareHosted()
-      await this.declareVoiceSupport()
-      await this.declareImageSupport()
-      await this.announceWaState()
-      if (!this.waStarted) this.initWa()
-    } else {
-      // Fresh session — Pair with the one-time code.
+  /**
+   * Bring the session up.
+   *
+   * A new pairing (one-time code, no sessionId yet) fails fast, exactly as before: a person is waiting on
+   * the HTTP request, the code is single-use, and an invalid code is an answer, not an outage.
+   *
+   * A restored session survives a hub that is down. The first attempt runs inline (so boot behaves as it
+   * always did when the hub is up, and restore() still goes one session at a time); if it fails, start()
+   * returns and the attempts continue in the background on {@link HUB_RETRY_DELAYS_MS} until the hub
+   * answers or stop() is called. Terminal answers never retry: a rejected token leaves the session
+   * blocked and idle, and "account not found" means the tenant is gone (thrown from the first attempt
+   * so restore() wipes it; from a later one the session closes itself and the manager wipes it).
+   */
+  async start(): Promise<void> {
+    if (!this.sessionId) {
+      const connection = this.buildConnection()
+      await connection.start()
       await this.pair()
+      return
     }
+
+    let attemptNo = 0
+    let terminal: unknown
+    let settleFirst!: () => void
+    let failFirst!: (err: unknown) => void
+    const first = new Promise<void>((resolve, reject) => {
+      settleFirst = resolve
+      failFirst = reject
+    })
+
+    const loop = retryUntil(
+      async () => {
+        attemptNo++
+        try {
+          await this.connectRestored()
+        } catch (err) {
+          // Never leak the half-built connection: left running it would auto-reconnect and register on
+          // the hub with nothing behind it.
+          await this.discardConnection()
+          if (isAccountGone(err)) {
+            terminal = err
+            if (attemptNo === 1) failFirst(err)
+            return
+          }
+          settleFirst()
+          throw err
+        }
+        settleFirst()
+      },
+      {
+        delaysMs: HUB_RETRY_DELAYS_MS,
+        isCancelled: () => this.cancelled,
+        onError: (err, n) =>
+          this.log.warn({ err, attempt: n }, '[hub] could not bring the session up - retrying'),
+      },
+    )
+
+    void loop
+      .then(() => {
+        if (terminal !== undefined && attemptNo > 1 && this.sessionId) {
+          this.log.warn('[hub] account gone while retrying - closing session')
+          this.handlers.onClosed(this.sessionId)
+          return this.stop()
+        }
+      })
+      .catch((err) => this.log.error({ err }, '[hub] retry loop failed'))
+
+    await first
+  }
+
+  /** One attempt to bring a restored session up. Throws on any failure; a rejected token is not one. */
+  private async connectRestored(): Promise<void> {
+    const connection = this.buildConnection()
+    await connection.start()
+    // stop() during the connect: it already closed the connection it knew about, never go on to register.
+    if (this.cancelled) {
+      await connection.stop().catch(() => { /* ignore */ })
+      return
+    }
+    // Restored session - re-register straight away.
+    if (!(await this.handshake(connection))) return
+    if (this.cancelled) return
+    await this.declareHosted()
+    await this.declareVoiceSupport()
+    await this.declareImageSupport()
+    await this.announceWaState()
+    if (this.cancelled) return
+    if (!this.waStarted) this.initWa()
+  }
+
+  /** Stop and forget the connection of a failed attempt so nothing leaks between retries. */
+  private async discardConnection(): Promise<void> {
+    const connection = this.connection
+    this.connection = null
+    this.gate.close()
+    if (connection) await connection.stop().catch(() => { /* ignore */ })
   }
 
   /**
@@ -841,7 +938,7 @@ export class ConnectorSession {
   }
 
   private initWa(): void {
-    if (this.waStarted || !this.sessionId || this.blocked) return
+    if (this.waStarted || !this.sessionId || this.blocked || this.cancelled) return
     this.waStarted = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
@@ -994,6 +1091,7 @@ export class ConnectorSession {
   }
 
   async stop(): Promise<void> {
+    this.cancelled = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
