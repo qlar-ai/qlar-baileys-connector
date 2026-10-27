@@ -4,15 +4,17 @@ import pino, { Logger } from 'pino'
 import { ConnectorSession, SessionMeta } from './connectorSession'
 import { isLinked } from './waSession'
 import { resolveSessionDir } from './guards'
+import type { ControlManager } from './controlServer'
 
 /**
  * Holds every live tenant session in this process, keyed by sessionId. This is
  * the multi-session core of the Public hosting server: `startFromCode` spins up
  * a new tenant, `restore` brings persisted ones back after a restart, and each
- * tenant's `{ sessionId, agentId, hubUrl }` is persisted to
+ * tenant's `{ sessionId, agentId, hubUrl, connectorToken? }` is persisted to
  * `<dataRoot>/<sessionId>/meta.json` so restarts don't need a QR rescan.
+ * `connectorToken` is absent in meta.json files written before tokens existed.
  */
-export class SessionManager {
+export class SessionManager implements ControlManager {
   private readonly sessions = new Map<string, ConnectorSession>()
   private readonly log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -29,6 +31,7 @@ export class SessionManager {
       {
         onRegistered: (meta) => this.register(meta, session),
         onClosed: (sessionId) => this.remove(sessionId),
+        onToken: (sessionId, token) => this.persistToken(sessionId, token),
       },
     )
 
@@ -51,6 +54,32 @@ export class SessionManager {
     }
     this.sessions.set(meta.sessionId, session)
     this.log.info({ sessionId: meta.sessionId, total: this.sessions.size }, '[manager] session registered')
+  }
+
+  /**
+   * Merge a token the session generated itself (and the hub accepted) into its meta.json, so the
+   * next restart presents the same one. Failure is logged, not thrown: the session keeps running,
+   * and the next restart simply generates and registers another token.
+   */
+  private persistToken(sessionId: string, token: string): void {
+    const dir = resolveSessionDir(this.dataRoot, sessionId)
+    if (!dir) {
+      this.log.warn({ sessionId }, '[manager] refusing to persist token: session id does not resolve inside the data root')
+      return
+    }
+    const metaPath = path.join(dir, 'meta.json')
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
+      fs.writeFileSync(metaPath, JSON.stringify({ ...meta, connectorToken: token }, null, 2), 'utf-8')
+      this.log.info({ sessionId }, '[manager] connector token persisted')
+    } catch (err) {
+      this.log.error({ err, sessionId }, '[manager] failed to persist connector token')
+    }
+  }
+
+  /** The live session's connector token, or undefined when the session is not live or has none yet. */
+  tokenFor(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.getConnectorToken()
   }
 
   /**
@@ -120,10 +149,16 @@ export class SessionManager {
         const session = new ConnectorSession(
           this.hubUrl,
           this.dataRoot,
-          { sessionId: meta.sessionId, agentId: meta.agentId },
+          {
+            sessionId: meta.sessionId,
+            agentId: meta.agentId,
+            // Absent in meta.json written before tokens; the session then generates one.
+            connectorToken: typeof meta.connectorToken === 'string' && meta.connectorToken ? meta.connectorToken : undefined,
+          },
           {
             onRegistered: (m) => this.register(m, session),
             onClosed: (id) => this.remove(id),
+            onToken: (id, token) => this.persistToken(id, token),
           },
         )
         this.sessions.set(meta.sessionId, session)

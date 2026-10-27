@@ -3,6 +3,7 @@ import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
+import { registerWithHub, tokenToPresent } from './hubHandshake'
 
 /**
  * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
@@ -74,6 +75,8 @@ export interface SessionMeta {
   sessionId: string
   agentId: string
   hubUrl: string
+  /** Proves to Messenger-BE that this connector owns the session. Absent in meta.json from before tokens. */
+  connectorToken?: string
 }
 
 export interface ConnectorSessionHandlers {
@@ -81,6 +84,8 @@ export interface ConnectorSessionHandlers {
   onRegistered: (meta: SessionMeta) => void
   /** Called when the session is finished for good — logged out, or a pairing nobody completed. */
   onClosed: (sessionId: string) => void
+  /** Called when the session generated its own token and the hub accepted it, so it can be persisted. */
+  onToken: (sessionId: string, token: string) => void
 }
 
 /**
@@ -102,21 +107,63 @@ export class ConnectorSession {
   // When this session started waiting for its first QR scan; null once WhatsApp has linked it,
   // and for restored sessions, which only come back when they were already linked.
   private unlinkedSince: number | null = null
+  // The per-session token presented to the hub and on uploads. Never logged.
+  private connectorToken: string | undefined
+  // Set when the hub rejected our token: the session stays idle (no retry, no WhatsApp) until re-paired.
+  private blocked = false
   private readonly log: Logger
 
   constructor(
     private readonly hubUrl: string,
     private readonly dataRoot: string,
-    private readonly opts: { code?: string; sessionId?: string; agentId?: string },
+    private readonly opts: { code?: string; sessionId?: string; agentId?: string; connectorToken?: string },
     private readonly handlers: ConnectorSessionHandlers,
   ) {
     this.sessionId = opts.sessionId ?? null
     this.agentId = opts.agentId ?? ''
+    this.connectorToken = opts.connectorToken || undefined
     this.log = pino({ level: process.env.LOG_LEVEL ?? 'info' }).child({ session: opts.sessionId ?? 'pairing' })
   }
 
   getSessionId(): string | null {
     return this.sessionId
+  }
+
+  /** The token this session presents, or undefined when it has none yet. */
+  getConnectorToken(): string | undefined {
+    return this.connectorToken
+  }
+
+  /**
+   * Re-register with the hub, presenting this session's token (or a freshly generated one, which is
+   * persisted once the hub accepts it). Returns false when the hub rejected the token: the session
+   * is then blocked and torn down to idle - never retried, so a mismatch cannot loop against the hub.
+   */
+  private async handshake(connection: signalR.HubConnection): Promise<boolean> {
+    if (!this.sessionId) return false
+    const sessionId = this.sessionId
+    const { token, fresh } = tokenToPresent(this.connectorToken)
+    const result = await registerWithHub(connection, sessionId, token)
+
+    if (result === 'rejected') {
+      if (!this.blocked) {
+        this.log.error('[hub] connector token rejected - session left idle until it is paired again')
+      }
+      this.blocked = true
+      await this.stop()
+      return false
+    }
+
+    if (fresh) {
+      this.connectorToken = token
+      this.handlers.onToken(sessionId, token)
+    }
+    return true
+  }
+
+  /** Header proving ownership of the session on the HTTP upload endpoints, when there is a token. */
+  private uploadHeaders(): Record<string, string> | undefined {
+    return this.connectorToken ? { 'X-Connector-Token': this.connectorToken } : undefined
   }
 
   private sessionDir(): string {
@@ -298,9 +345,9 @@ export class ConnectorSession {
     })
 
     connection.onreconnected(async () => {
-      if (!this.sessionId) return
+      if (!this.sessionId || this.blocked) return
       try {
-        await connection.invoke('Reconnect', this.sessionId)
+        if (!(await this.handshake(connection))) return
         // Re-declared on every reconnect, not just at startup. Messenger-BE drops the
         // session's in-memory status when the connection goes, so a transport blip would
         // otherwise leave it reporting this channel as self-hosted — and the CMS would
@@ -318,7 +365,7 @@ export class ConnectorSession {
 
     if (this.sessionId) {
       // Restored session — re-register straight away.
-      await connection.invoke('Reconnect', this.sessionId)
+      if (!(await this.handshake(connection))) return
       await this.declareHosted()
       await this.declareVoiceSupport()
       await this.declareImageSupport()
@@ -448,6 +495,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-image`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -519,6 +567,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-document`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -588,6 +637,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-audio`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -668,11 +718,23 @@ export class ConnectorSession {
     if (!this.connection) throw new Error('connection not initialised')
     if (!this.opts.code) throw new Error('no pairing code and no sessionId')
 
-    const result = await this.connection.invoke<{ sessionId: string; agentId: string }>('Pair', this.opts.code)
+    const result = await this.connection.invoke<{ sessionId: string; agentId: string; connectorToken?: string | null }>(
+      'Pair',
+      this.opts.code,
+    )
     this.sessionId = result.sessionId
     this.agentId = result.agentId
-    this.log.info({ sessionId: this.sessionId }, '[hub] paired')
-    this.handlers.onRegistered({ sessionId: this.sessionId, agentId: this.agentId, hubUrl: this.hubUrl })
+    // Null when the server's token store was down, absent from a server that predates tokens. Either
+    // way the session pairs without one and registers its own at the first ReconnectSecure.
+    this.connectorToken =
+      typeof result.connectorToken === 'string' && result.connectorToken ? result.connectorToken : undefined
+    this.log.info({ sessionId: this.sessionId, hasToken: this.connectorToken !== undefined }, '[hub] paired')
+    this.handlers.onRegistered({
+      sessionId: this.sessionId,
+      agentId: this.agentId,
+      hubUrl: this.hubUrl,
+      connectorToken: this.connectorToken,
+    })
     await this.declareHosted()
     await this.declareVoiceSupport()
     await this.declareImageSupport()
@@ -695,7 +757,7 @@ export class ConnectorSession {
   }
 
   private initWa(): void {
-    if (this.waStarted || !this.sessionId) return
+    if (this.waStarted || !this.sessionId || this.blocked) return
     this.waStarted = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
