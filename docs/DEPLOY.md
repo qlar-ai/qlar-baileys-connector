@@ -64,6 +64,8 @@ git rev-list --left-right --count origin/<branch>...HEAD   # must be "0  0"
 
 It runs only when the server's code changes (`src/**`, `package*.json`, `tsconfig.json`, `.nvmrc`, the workflow itself) — every deploy restarts the app, which drops and reconnects every tenant's WhatsApp socket, so a docs change should not. **Actions → Deploy hosted connector → Run workflow** deploys the chosen branch (`dev` or `main`) on demand.
 
+Merging to `dev` deploys the hosted connector automatically (`.github/workflows/deploy.yml`, paths `src/**`, `package*.json`, `tsconfig.json`, `.nvmrc`); for this change merge the connector only after Messenger-BE is live on DEV.
+
 What it does: `npm ci` + `tsc --noEmit` + a check that `src/server/main.ts` exists → `git archive` → `az webapp deploy --type zip` (Oryx builds on Azure, then one restart) → polls `/health` for up to 5 minutes. A **stopped** app is deployed but left stopped, with a warning instead of a health check.
 
 ### Setup (done 2026-10-07)
