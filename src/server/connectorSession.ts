@@ -885,9 +885,16 @@ export class ConnectorSession {
               this.log.error({ statusCode, reason: decision.reason }, '[wa] terminal close — not reconnecting, session left offline')
               return
             }
-            this.reconnectAttempt++
+            // One pending reconnect at a time: a replaced timer is the same reconnect, not a new attempt.
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+            else this.reconnectAttempt++
             this.log.info({ attempt: this.reconnectAttempt, delayMs: decision.delayMs }, '[wa] scheduling reconnect')
-            this.reconnectTimer = setTimeout(() => this.initWa(), decision.delayMs)
+            this.reconnectTimer = setTimeout(() => {
+              this.reconnectTimer = null
+              // stop() nulls the connection; never revive a stopped session.
+              if (!this.connection) return
+              this.initWa()
+            }, decision.delayMs)
             return
           }
           // WhatsApp logged this device out (401 loggedOut). These creds are dead —
