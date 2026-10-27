@@ -8,7 +8,7 @@ import type * as http from 'http'
 import { resolveSessionDir, readBodyLimited, PayloadTooLargeError, RequestTimeoutError } from './guards'
 
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'guards-'))
-const fakeReq = () => Object.assign(new EventEmitter(), { destroy() {} }) as unknown as http.IncomingMessage & EventEmitter
+const fakeReq = () => Object.assign(new EventEmitter(), { destroy() { throw new Error('readBodyLimited must not destroy the request') }, pause() {} }) as unknown as http.IncomingMessage & EventEmitter
 
 test('resolveSessionDir_Guid_ReturnsChildPath', () => {
   const r = root()

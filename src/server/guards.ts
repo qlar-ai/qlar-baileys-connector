@@ -20,41 +20,54 @@ export function resolveSessionDir(dataRoot: string, sessionId: string): string |
 export class PayloadTooLargeError extends Error {}
 export class RequestTimeoutError extends Error {}
 
-/** Read a request body, rejecting if it exceeds maxBytes, stalls past timeoutMs, or the client aborts. */
+/**
+ * Read a request body, rejecting if it exceeds maxBytes, stalls past timeoutMs, or the client aborts.
+ * On over-limit / timeout the request is paused (nothing more is buffered) but NOT destroyed, so the
+ * caller can still write its 413 / 408 response; the caller closes the connection afterwards.
+ */
 export function readBodyLimited(req: http.IncomingMessage, maxBytes: number, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     let settled = false
 
-    const finish = (fn: () => void): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      fn()
-    }
-    const timer = setTimeout(() => {
-      finish(() => {
-        reject(new RequestTimeoutError('request body timed out'))
-        req.destroy()
-      })
-    }, timeoutMs)
-
-    req.on('data', (chunk: Buffer | string) => {
+    const onData = (chunk: Buffer | string): void => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       size += buf.length
       if (size > maxBytes) {
-        finish(() => {
-          reject(new PayloadTooLargeError('request body too large'))
-          req.destroy()
-        })
+        finish(() => reject(new PayloadTooLargeError('request body too large')), true)
         return
       }
       chunks.push(buf)
-    })
-    req.on('end', () => finish(() => resolve(Buffer.concat(chunks).toString('utf-8'))))
-    req.on('aborted', () => finish(() => reject(new Error('request aborted'))))
-    req.on('error', (err) => finish(() => reject(err)))
-    req.on('close', () => finish(() => reject(new Error('request closed before end'))))
+    }
+    const onEnd = (): void => finish(() => resolve(Buffer.concat(chunks).toString('utf-8')), false)
+    const onAborted = (): void => finish(() => reject(new Error('request aborted')), false)
+    const onError = (err: Error): void => finish(() => reject(err), false)
+    const onClose = (): void => finish(() => reject(new Error('request closed before end')), false)
+    const timer = setTimeout(
+      () => finish(() => reject(new RequestTimeoutError('request body timed out')), true),
+      timeoutMs,
+    )
+
+    const finish = (settle: () => void, stopReading: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      req.removeListener('data', onData)
+      req.removeListener('end', onEnd)
+      req.removeListener('aborted', onAborted)
+      req.removeListener('error', onError)
+      req.removeListener('close', onClose)
+      // A late socket error must not become an uncaught exception once we stop listening.
+      req.on('error', () => { /* ignore */ })
+      if (stopReading) req.pause()
+      settle()
+    }
+
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('aborted', onAborted)
+    req.on('error', onError)
+    req.on('close', onClose)
   })
 }

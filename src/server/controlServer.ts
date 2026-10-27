@@ -14,14 +14,17 @@ const log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
  *   GET    /sessions                    → list live sessionIds
  *   GET    /health                      → liveness + session count
  */
-export function startControlServer(manager: SessionManager, port: number): void {
-  const server = http.createServer((req, res) => {
-    handleRequest(req, res, manager).catch((err) => {
+export function createControlServer(manager: SessionManager, bodyTimeoutMs = 10_000): http.Server {
+  return http.createServer((req, res) => {
+    handleRequest(req, res, manager, bodyTimeoutMs).catch((err) => {
       log.error({ err }, '[control] unhandled request error')
-      sendJson(res, 500, { error: 'internal error' })
+      if (!res.headersSent) sendJson(res, 500, { error: 'internal error' })
     })
   })
+}
 
+export function startControlServer(manager: SessionManager, port: number): void {
+  const server = createControlServer(manager)
   server.listen(port, () => log.info('[control] listening on port %d', port))
 }
 
@@ -29,6 +32,7 @@ async function handleRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   manager: SessionManager,
+  bodyTimeoutMs: number,
 ): Promise<void> {
   applyCors(res)
 
@@ -53,12 +57,12 @@ async function handleRequest(
   if (req.method === 'POST' && url === '/sessions') {
     let body: string
     try {
-      body = await readBodyLimited(req, 4096, 10_000)
+      body = await readBodyLimited(req, 4096, bodyTimeoutMs)
     } catch (err) {
       if (err instanceof PayloadTooLargeError) {
-        sendJson(res, 413, { error: 'request body too large' })
+        sendJsonAndClose(req, res, 413, { error: 'request body too large' })
       } else if (err instanceof RequestTimeoutError) {
-        sendJson(res, 408, { error: 'request timed out' })
+        sendJsonAndClose(req, res, 408, { error: 'request timed out' })
       } else {
         log.warn({ err }, '[control] request body read failed')
       }
@@ -112,6 +116,13 @@ function applyCors(res: http.ServerResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+}
+
+/** Deliver the response first, then drop the connection so the unread body is not left streaming in. */
+function sendJsonAndClose(req: http.IncomingMessage, res: http.ServerResponse, status: number, body: unknown): void {
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(status, { 'Content-Type': 'application/json', Connection: 'close' })
+  res.end(JSON.stringify(body), () => req.destroy())
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
