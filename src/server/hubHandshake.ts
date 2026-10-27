@@ -34,14 +34,36 @@ export function newConnectorToken(): string {
   return randomBytes(32).toString('base64url')
 }
 
+function nonEmpty(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
 /**
- * The token to present: the stored one when there is one, otherwise a freshly generated one that
- * the caller must persist once the hub has accepted it (the server registers the first token it is
- * shown for a session that has none).
+ * The token to present at a handshake.
+ *
+ * - A promoted (server-registered) token always wins.
+ * - Otherwise a pending one is reused: the server stores the first token it is shown (TOFU), so if
+ *   it stored one but its reply never arrived, presenting a different token next time would be
+ *   rejected and lock the session out. Reusing the same token until the hub answers avoids that.
+ * - Only when there is neither is a new token generated; the caller must persist it as pending
+ *   BEFORE presenting it, so it also survives a process restart.
  */
-export function tokenToPresent(stored: string | null | undefined): { token: string; fresh: boolean } {
-  if (typeof stored === 'string' && stored.length > 0) return { token: stored, fresh: false }
-  return { token: newConnectorToken(), fresh: true }
+export function nextTokenToPresent(
+  persisted: string | null | undefined,
+  pending: string | null | undefined,
+): { token: string; isNew: boolean; shouldPersistPending: boolean } {
+  if (nonEmpty(persisted)) return { token: persisted, isNew: false, shouldPersistPending: false }
+  if (nonEmpty(pending)) return { token: pending, isNew: false, shouldPersistPending: false }
+  return { token: newConnectorToken(), isNew: true, shouldPersistPending: true }
+}
+
+/**
+ * What to do with the presented token once the hub answered. Only 'secured' promotes a token that
+ * was not already the persisted one; 'legacy' (old server, never saw it) and 'rejected' promote
+ * nothing - a pending token is never used as the DELETE bearer or upload header.
+ */
+export function afterHandshake(result: HandshakeResult, presentedWasPersisted: boolean): { promote: boolean } {
+  return { promote: shouldPersistToken(result, !presentedWasPersisted) }
 }
 
 function errorMessage(err: unknown): string {
@@ -71,7 +93,7 @@ export async function registerWithHub(
 export type PostPairResult =
   | { outcome: 'secured'; token: string }
   | { outcome: 'unsecured'; reason: 'old-server' }
-  | { outcome: 'unsecured'; reason: 'error'; error: unknown }
+  | { outcome: 'unsecured'; reason: 'error'; error: unknown; token: string }
   | { outcome: 'rejected' }
 
 /**
@@ -84,9 +106,9 @@ export type PostPairResult =
  * session unsecured and working as before; pairing must never fail because this step did.
  * Only an explicit "token rejected" is reported as such.
  *
- * Accepted edge case: if the server stored the token but its reply was lost, this reports
- * 'unsecured' and nothing is persisted, so a later restart presents a different token and is
- * rejected until the session is paired again. Rare, and preferred over guessing.
+ * On any other failure the server may still have stored the token (a lost reply), so the token is
+ * handed back for the caller to keep as pending and present again at the next handshake. On an old
+ * server nothing was stored and no token is returned.
  */
 export async function secureAfterPair(
   conn: { invoke: (method: string, ...args: unknown[]) => Promise<unknown> },
@@ -100,6 +122,6 @@ export async function secureAfterPair(
     const msg = errorMessage(err)
     if (/token rejected/i.test(msg)) return { outcome: 'rejected' }
     if (/method does not exist/i.test(msg)) return { outcome: 'unsecured', reason: 'old-server' }
-    return { outcome: 'unsecured', reason: 'error', error: err }
+    return { outcome: 'unsecured', reason: 'error', error: err, token }
   }
 }

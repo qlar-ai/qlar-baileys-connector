@@ -2,16 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as http from 'http'
 import * as net from 'net'
-import Module from 'module'
-
-// Same stub as sessionManager.test.ts: the real ConnectorSession drags in Baileys, which tsx can't load.
-const origLoad = (Module as any)._load
-;(Module as any)._load = function (request: string, ...rest: unknown[]) {
-  if (request === './connectorSession') return { ConnectorSession: class {} }
-  if (request === './waSession') return { isLinked: () => true }
-  return origLoad.call(this, request, ...rest)
-}
-const { createControlServer } = require('./controlServer') as typeof import('./controlServer')
+// controlServer depends only on guards and a ControlManager interface, so no Baileys stub is needed.
+import { createControlServer } from './controlServer'
 
 /**
  * A ControlManager double: live session `live-1` holding token `secret-token`, and live session

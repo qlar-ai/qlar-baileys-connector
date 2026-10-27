@@ -8,15 +8,24 @@ import Module from 'module'
 // Loading the real ConnectorSession pulls in Baileys, whose ESM-only deps don't resolve under tsx.
 // These tests never start a session, so stub the two modules that drag it in.
 // The stub records each session it is asked to create, so the token flow can be checked without Baileys.
-type FakeHandlers = { onRegistered: (m: unknown) => void; onClosed: (id: string) => void; onToken: (id: string, t: string) => void }
-type FakeOpts = { code?: string; sessionId?: string; agentId?: string; connectorToken?: string }
+type FakeHandlers = {
+  onRegistered: (m: unknown) => void
+  onClosed: (id: string) => void
+  onToken: (id: string, t: string) => void
+  onPendingToken: (id: string, t: string) => void
+}
+type FakeOpts = { code?: string; sessionId?: string; agentId?: string; connectorToken?: string; pendingConnectorToken?: string }
 const created: FakeSession[] = []
 class FakeSession {
   constructor(public hubUrl: string, public dataRoot: string, public opts: FakeOpts, public handlers: FakeHandlers) {
     created.push(this)
   }
-  async start(): Promise<void> { /* no hub */ }
-  async stop(): Promise<void> { /* nothing */ }
+  stopped = false
+  async start(): Promise<void> {
+    // A restored session whose id starts with 'fail-' fails to start with a transient (non-account) error.
+    if (this.opts.sessionId?.startsWith('fail-')) throw new Error('hub unreachable')
+  }
+  async stop(): Promise<void> { this.stopped = true }
   async revoke(): Promise<void> { /* nothing */ }
   getConnectorToken(): string | undefined { return this.opts.connectorToken }
 }
@@ -108,4 +117,51 @@ test('register_PairResultWithNullToken_WritesMetaWithoutCrashing', async () => {
   created[0].handlers.onRegistered({ sessionId: 'paired-1', agentId: 'a', hubUrl: 'h', connectorToken: undefined })
   const meta = JSON.parse(fs.readFileSync(path.join(dataRoot, 'paired-1', 'meta.json'), 'utf-8'))
   assert.deepEqual(meta, { sessionId: 'paired-1', agentId: 'a', hubUrl: 'h' })
+})
+
+test('persistPendingToken_MergesIntoMetaJson_KeepsOtherFields_TokenForIgnoresIt', async () => {
+  const s = setupWithMeta({ sessionId: 'old-4', agentId: 'agent-4', hubUrl: 'h' })
+  await s.manager.restore()
+  created[0].handlers.onPendingToken('old-4', 'pending-tok')
+  const meta = JSON.parse(fs.readFileSync(path.join(s.dir, 'meta.json'), 'utf-8'))
+  assert.deepEqual(meta, { sessionId: 'old-4', agentId: 'agent-4', hubUrl: 'h', pendingConnectorToken: 'pending-tok' })
+  assert.equal(s.manager.tokenFor('old-4'), undefined)
+})
+
+test('restore_MetaWithPendingOnly_PassesPending_TokenForUndefined', async () => {
+  const s = setupWithMeta({ sessionId: 'old-5', agentId: 'a', hubUrl: 'h', pendingConnectorToken: 'pending-tok' })
+  await s.manager.restore()
+  assert.equal(created[0].opts.pendingConnectorToken, 'pending-tok')
+  assert.equal(created[0].opts.connectorToken, undefined)
+  assert.equal(s.manager.tokenFor('old-5'), undefined)
+})
+
+test('onToken_PromotesAndClearsPending', async () => {
+  const s = setupWithMeta({ sessionId: 'old-6', agentId: 'a', hubUrl: 'h', pendingConnectorToken: 'pending-tok' })
+  await s.manager.restore()
+  created[0].handlers.onToken('old-6', 'pending-tok')
+  const meta = JSON.parse(fs.readFileSync(path.join(s.dir, 'meta.json'), 'utf-8'))
+  assert.deepEqual(meta, { sessionId: 'old-6', agentId: 'a', hubUrl: 'h', connectorToken: 'pending-tok' })
+})
+
+test('restore_StartFailsTransiently_StopsSession_KeepsDir', async () => {
+  const s = setupWithMeta({ sessionId: 'fail-1', agentId: 'a', hubUrl: 'h' })
+  await s.manager.restore()
+  assert.equal(created[0].stopped, true)
+  assert.equal(s.manager.isLive('fail-1'), false)
+  assert.ok(fs.existsSync(s.dir))
+})
+
+test('register_UnsafeSessionIdFromPair_Throws_WritesNothing', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-unsafe-'))
+  const dataRoot = path.join(base, 'data')
+  created.length = 0
+  const manager = new SessionManager('http://localhost/hub', dataRoot)
+  await manager.startFromCode('CODE2')
+  for (const id of ['..', '', '../x', 'a/b']) {
+    assert.throws(() => created[0].handlers.onRegistered({ sessionId: id, agentId: 'a', hubUrl: 'h' }), /unsafe session id/i)
+  }
+  assert.ok(!fs.existsSync(path.join(base, 'meta.json')))
+  assert.ok(!fs.existsSync(path.join(dataRoot, 'meta.json')))
+  assert.equal(manager.count(), 0)
 })

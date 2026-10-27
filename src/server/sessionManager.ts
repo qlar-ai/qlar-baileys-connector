@@ -12,7 +12,7 @@ import type { ControlManager } from './controlServer'
  * a new tenant, `restore` brings persisted ones back after a restart, and each
  * tenant's `{ sessionId, agentId, hubUrl, connectorToken? }` is persisted to
  * `<dataRoot>/<sessionId>/meta.json` so restarts don't need a QR rescan.
- * `connectorToken` is absent in meta.json files written before tokens existed.
+ * `connectorToken` / `pendingConnectorToken` are absent in meta.json files written before tokens existed.
  */
 export class SessionManager implements ControlManager {
   private readonly sessions = new Map<string, ConnectorSession>()
@@ -32,6 +32,7 @@ export class SessionManager implements ControlManager {
         onRegistered: (meta) => this.register(meta, session),
         onClosed: (sessionId) => this.remove(sessionId),
         onToken: (sessionId, token) => this.persistToken(sessionId, token),
+        onPendingToken: (sessionId, token) => this.persistPendingToken(sessionId, token),
       },
     )
 
@@ -44,7 +45,11 @@ export class SessionManager implements ControlManager {
   }
 
   private register(meta: SessionMeta, session: ConnectorSession): void {
-    const dir = path.join(this.dataRoot, meta.sessionId)
+    const dir = resolveSessionDir(this.dataRoot, meta?.sessionId ?? '')
+    if (!dir) {
+      // Thrown back into pair(), so the pairing fails instead of writing outside the data root.
+      throw new Error('Refusing to register an unsafe session id')
+    }
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf-8')
 
@@ -57,23 +62,39 @@ export class SessionManager implements ControlManager {
   }
 
   /**
-   * Merge a token the session generated itself (and the hub accepted) into its meta.json, so the
-   * next restart presents the same one. Failure is logged, not thrown: the session keeps running,
-   * and the next restart simply generates and registers another token.
+   * Merge a token the hub confirmed into meta.json as `connectorToken` (promoted), dropping any
+   * pending one, so the next restart presents the same token.
    */
   private persistToken(sessionId: string, token: string): void {
+    this.updateMeta(sessionId, 'connector token persisted', (meta) => {
+      const rest: SessionMeta = { ...meta }
+      delete rest.pendingConnectorToken
+      return { ...rest, connectorToken: token }
+    })
+  }
+
+  /**
+   * Remember a self-generated token before it is first presented, so a lost reply or a restart
+   * re-presents the same one. Never used by {@link tokenFor}.
+   */
+  private persistPendingToken(sessionId: string, token: string): void {
+    this.updateMeta(sessionId, 'pending connector token persisted', (meta) => ({ ...meta, pendingConnectorToken: token }))
+  }
+
+  /** Read-modify-write of a session's meta.json. Failure is logged (never the token), not thrown. */
+  private updateMeta(sessionId: string, what: string, change: (meta: SessionMeta) => SessionMeta): void {
     const dir = resolveSessionDir(this.dataRoot, sessionId)
     if (!dir) {
-      this.log.warn({ sessionId }, '[manager] refusing to persist token: session id does not resolve inside the data root')
+      this.log.warn({ sessionId }, '[manager] refusing to update meta.json: session id does not resolve inside the data root')
       return
     }
     const metaPath = path.join(dir, 'meta.json')
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
-      fs.writeFileSync(metaPath, JSON.stringify({ ...meta, connectorToken: token }, null, 2), 'utf-8')
-      this.log.info({ sessionId }, '[manager] connector token persisted')
+      fs.writeFileSync(metaPath, JSON.stringify(change(meta), null, 2), 'utf-8')
+      this.log.info({ sessionId, what }, '[manager] meta.json updated')
     } catch (err) {
-      this.log.error({ err, sessionId }, '[manager] failed to persist connector token')
+      this.log.error({ err, sessionId, what }, '[manager] meta.json update failed')
     }
   }
 
@@ -148,29 +169,35 @@ export class SessionManager implements ControlManager {
         continue
       }
 
+      let session: ConnectorSession | undefined
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
-        const session = new ConnectorSession(
+        const restored: ConnectorSession = new ConnectorSession(
           this.hubUrl,
           this.dataRoot,
           {
             sessionId: meta.sessionId,
             agentId: meta.agentId,
-            // Absent in meta.json written before tokens; the session then generates one.
-            connectorToken: typeof meta.connectorToken === 'string' && meta.connectorToken ? meta.connectorToken : undefined,
+            // Both absent in meta.json written before tokens; the session then generates one.
+            connectorToken: nonEmptyString(meta.connectorToken),
+            pendingConnectorToken: nonEmptyString(meta.pendingConnectorToken),
           },
           {
-            onRegistered: (m) => this.register(m, session),
+            onRegistered: (m) => this.register(m, restored),
             onClosed: (id) => this.remove(id),
             onToken: (id, token) => this.persistToken(id, token),
+            onPendingToken: (id, token) => this.persistPendingToken(id, token),
           },
         )
-        this.sessions.set(meta.sessionId, session)
-        await session.start()
+        session = restored
+        this.sessions.set(meta.sessionId, restored)
+        await restored.start()
         this.log.info({ sessionId: meta.sessionId }, '[manager] restored session')
       } catch (err) {
-        // Don't leave a dead entry in the map if start() failed.
+        // Don't leave a dead entry in the map if start() failed, nor its SignalR connection open:
+        // left running it would keep auto-reconnecting and re-register on the hub with no WhatsApp behind it.
         this.sessions.delete(sessionId)
+        if (session) await session.stop().catch(() => { /* ignore */ })
 
         // "Messenger account not found" comes from the hub (HubException) when the
         // account was deleted (e.g. via CMS). This session is permanently dead —
@@ -187,16 +214,11 @@ export class SessionManager implements ControlManager {
     }
   }
 
-  /** True when the id maps to a directory strictly inside the data root. */
-  isValidSessionId(sessionId: string): boolean {
-    return resolveSessionDir(this.dataRoot, sessionId) !== null
-  }
-
-  list(): string[] {
-    return Array.from(this.sessions.keys())
-  }
-
   count(): number {
     return this.sessions.size
   }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined
 }
