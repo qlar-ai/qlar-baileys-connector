@@ -2,6 +2,7 @@ import * as path from 'path'
 import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
+import { decideReconnect } from './reconnectPolicy'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
 import { afterHandshake, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
 import { resolveSessionDir } from './guards'
@@ -116,6 +117,8 @@ export class ConnectorSession {
   private agentId: string
   private waStarted = false
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // Consecutive failed reconnects since the socket was last open; drives the backoff.
+  private reconnectAttempt = 0
   // When this session started waiting for its first QR scan; null once WhatsApp has linked it,
   // and for restored sessions, which only come back when they were already linked.
   private unlinkedSince: number | null = null
@@ -819,6 +822,7 @@ export class ConnectorSession {
     await this.declareVoiceSupport()
     await this.declareImageSupport()
     this.unlinkedSince = Date.now()
+    this.reconnectAttempt = 0
     this.initWa()
   }
 
@@ -856,6 +860,7 @@ export class ConnectorSession {
         onConnected: (phone) => {
           this.log.info({ phone }, '[wa] connected')
           this.unlinkedSince = null
+          this.reconnectAttempt = 0
           this.hubInvoke(conn, 'Connected', sessionId, phone).catch((err) => this.log.error({ err }, '[hub] Connected failed'))
         },
         onDisconnected: (reason, shouldReconnect, statusCode) => {
@@ -873,7 +878,16 @@ export class ConnectorSession {
           }
           this.hubInvoke(conn, 'Disconnected', sessionId, reason).catch(() => { /* hub may be offline */ })
           if (shouldReconnect) {
-            this.reconnectTimer = setTimeout(() => this.initWa(), 5000)
+            const decision = decideReconnect(statusCode, this.reconnectAttempt)
+            if (!decision.reconnect) {
+              // Another device took this session over (440), or WhatsApp refused it (403/411).
+              // Retrying only fights the other side. Leave it offline; creds are NOT wiped.
+              this.log.error({ statusCode, reason: decision.reason }, '[wa] terminal close — not reconnecting, session left offline')
+              return
+            }
+            this.reconnectAttempt++
+            this.log.info({ attempt: this.reconnectAttempt, delayMs: decision.delayMs }, '[wa] scheduling reconnect')
+            this.reconnectTimer = setTimeout(() => this.initWa(), decision.delayMs)
             return
           }
           // WhatsApp logged this device out (401 loggedOut). These creds are dead —
