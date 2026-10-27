@@ -412,8 +412,9 @@ export class ConnectorSession {
       await this.stop()
     })
 
-    connection.onreconnecting(() => this.gate.close())
-    connection.onclose(() => this.gate.close())
+    // Tied to this very connection: a discarded one's late event must not close its successor's gate.
+    connection.onreconnecting(() => { if (connection === this.connection) this.gate.close() })
+    connection.onclose(() => { if (connection === this.connection) this.gate.close() })
 
     connection.onreconnected(async () => {
       if (!this.sessionId || this.blocked) return
