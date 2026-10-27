@@ -73,6 +73,8 @@ test('restore_MetaWithoutToken_StillRestores_NoTokenPassed', async () => {
   assert.equal(created[0].opts.connectorToken, undefined)
   assert.equal(s.manager.count(), 1)
   assert.equal(s.manager.tokenFor('old-1'), undefined)
+  assert.equal(s.manager.isLive('old-1'), true)
+  assert.equal(s.manager.isLive('unknown'), false)
 })
 
 test('restore_MetaWithToken_PassesTokenToSession_TokenForReturnsIt', async () => {

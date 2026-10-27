@@ -12,11 +12,14 @@ const log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
  *
  *   POST   /sessions        { code }   → start a new tenant (Pair with the code; the code is the credential)
  *   DELETE /sessions/:id                → stop + wipe a tenant; requires `Authorization: Bearer <session token>`
+ *                                         (secured sessions only; unsecured ones are revoked as before)
  *   GET    /sessions                    → { count } only - never the tenant ids
  *   GET    /health                      → liveness + session count
  */
 export interface ControlManager {
   count(): number
+  /** True when the session is live in this process (with or without a token). */
+  isLive(sessionId: string): boolean
   startFromCode(code: string): Promise<void>
   tokenFor(sessionId: string): string | undefined
   stop(sessionId: string): Promise<void>
@@ -137,13 +140,14 @@ async function handleRequest(
       sendJson(res, 400, { error: 'invalid session id' })
       return
     }
-    const token = manager.tokenFor(sessionId)
-    if (token === undefined) {
-      // Not live here (or never secured): nothing is stopped or deleted, so this is idempotent.
+    if (!manager.isLive(sessionId)) {
+      // Not live here: nothing is stopped or deleted, so this is idempotent.
       sendJson(res, 200, { ok: true })
       return
     }
-    if (!bearerMatches(req.headers.authorization, token)) {
+    const token = manager.tokenFor(sessionId)
+    // A live session that never registered a token is revoked exactly as before tokens existed.
+    if (token !== undefined && !bearerMatches(req.headers.authorization, token)) {
       log.warn({ sessionId }, '[control] DELETE refused: bearer does not match the session token')
       sendJson(res, 401, { error: 'unauthorized' })
       return

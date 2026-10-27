@@ -3,7 +3,7 @@ import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
-import { registerWithHub, secureAfterPair, tokenToPresent } from './hubHandshake'
+import { registerWithHub, secureAfterPair, shouldPersistToken, tokenToPresent } from './hubHandshake'
 
 /**
  * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
@@ -154,7 +154,9 @@ export class ConnectorSession {
       return false
     }
 
-    if (fresh) {
+    // Only a token the server really registered is kept; after a legacy Reconnect the session stays
+    // unsecured exactly as before tokens (no header, revocable without a bearer).
+    if (shouldPersistToken(result, fresh)) {
       this.connectorToken = token
       this.handlers.onToken(sessionId, token)
     }
@@ -725,6 +727,8 @@ export class ConnectorSession {
     // Secure the session on this same connection with a token of our own. Only a successful step
     // yields a token to persist; an old Messenger-BE or a transient failure leaves the session
     // unsecured (exactly as before tokens), and only an explicit rejection stops the pairing.
+    // A reply lost after the server stored the token leaves us unsecured and a later restart is
+    // rejected until re-paired; rare, and accepted (see secureAfterPair).
     const secured = await secureAfterPair(this.connection, this.sessionId)
     if (secured.outcome === 'rejected') {
       if (!this.blocked) {

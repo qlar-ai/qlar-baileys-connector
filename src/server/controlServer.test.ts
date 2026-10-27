@@ -13,13 +13,18 @@ const origLoad = (Module as any)._load
 }
 const { createControlServer } = require('./controlServer') as typeof import('./controlServer')
 
-/** A ControlManager double: one live session `live-1` holding token `secret-token`. */
+/**
+ * A ControlManager double: live session `live-1` holding token `secret-token`, and live session
+ * `live-unsecured` with no token (paired by an old connector / against an old server).
+ */
 function fakeManager() {
   const calls = { stop: [] as string[], startFromCode: [] as string[] }
   const tokens = new Map<string, string>([['live-1', 'secret-token']])
+  const live = new Set<string>(['live-1', 'live-unsecured'])
   return {
     calls,
-    count: () => tokens.size,
+    count: () => live.size,
+    isLive: (sessionId: string) => live.has(sessionId),
     startFromCode: async (code: string) => {
       calls.startFromCode.push(code)
     },
@@ -97,7 +102,7 @@ test('GET_sessions_ReturnsCountOnly_NoIds', async () => {
   await withServer(10_000, async (port) => {
     const res = await request(port, 'GET', '/sessions')
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { count: 1 })
+    assert.deepEqual(JSON.parse(res.body), { count: 2 })
     assert.ok(!res.body.includes('live-1'))
   })
 })
@@ -106,7 +111,7 @@ test('GET_health_Unchanged', async () => {
   await withServer(10_000, async (port) => {
     const res = await request(port, 'GET', '/health')
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { ok: true, sessions: 1 })
+    assert.deepEqual(JSON.parse(res.body), { ok: true, sessions: 2 })
   })
 })
 
@@ -190,5 +195,32 @@ test('OPTIONS_AllowsPostOnly', async () => {
     assert.equal(res.headers['access-control-allow-methods'], 'POST, OPTIONS')
     assert.equal(res.headers['access-control-allow-origin'], '*')
     assert.equal(res.headers['access-control-allow-headers'], 'Content-Type')
+  })
+})
+
+test('DELETE_LiveUnsecuredSession_StopsWithoutBearer', async () => {
+  await withServer(10_000, async (port, manager) => {
+    // Exactly as before tokens: an unsecured session is revoked without a bearer.
+    const res = await request(port, 'DELETE', '/sessions/live-unsecured')
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true })
+    assert.deepEqual(manager.calls.stop, ['live-unsecured'])
+  })
+})
+
+test('DELETE_LiveSecuredSession_NoBearer_401', async () => {
+  await withServer(10_000, async (port, manager) => {
+    const res = await request(port, 'DELETE', '/sessions/live-1')
+    assert.equal(res.status, 401)
+    assert.deepEqual(manager.calls.stop, [])
+  })
+})
+
+test('DELETE_NotLiveSession_200_StopNotCalled', async () => {
+  await withServer(10_000, async (port, manager) => {
+    const res = await request(port, 'DELETE', '/sessions/gone-7')
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true })
+    assert.deepEqual(manager.calls.stop, [])
   })
 })

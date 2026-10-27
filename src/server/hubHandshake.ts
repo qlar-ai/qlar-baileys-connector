@@ -13,7 +13,21 @@ import { randomBytes } from 'crypto'
  * Kept free of SignalR and Baileys so the decision is unit-testable.
  */
 
-export type HandshakeResult = 'ok' | 'rejected'
+/**
+ * 'secured'  - the server accepted (or first-registered) the token: the session is protected.
+ * 'legacy'   - an old server without ReconnectSecure; registered through Reconnect, token never seen.
+ * 'rejected' - the server holds a different token for this session.
+ */
+export type HandshakeResult = 'secured' | 'legacy' | 'rejected'
+
+/**
+ * Whether the presented token must now be persisted: only a freshly generated one that the server
+ * really registered. A legacy registration never saw it - persisting it would make the session look
+ * secured here while the server cannot authenticate to it (an old server's DELETE carries no bearer).
+ */
+export function shouldPersistToken(result: HandshakeResult, wasFresh: boolean): boolean {
+  return result === 'secured' && wasFresh
+}
 
 /** A fresh connector token: 32 random bytes, base64url (43 characters, no padding). */
 export function newConnectorToken(): string {
@@ -41,14 +55,14 @@ export async function registerWithHub(
 ): Promise<HandshakeResult> {
   try {
     await conn.invoke('ReconnectSecure', sessionId, token)
-    return 'ok'
+    return 'secured'
   } catch (err) {
     const msg = errorMessage(err)
     if (/token rejected/i.test(msg)) return 'rejected'
     if (/method does not exist/i.test(msg)) {
       // A Messenger-BE that predates tokens. Any failure of the legacy call propagates as before.
       await conn.invoke('Reconnect', sessionId)
-      return 'ok'
+      return 'legacy'
     }
     throw err
   }
@@ -69,6 +83,10 @@ export type PostPairResult =
  * "account not found" mid-wizard. A server that predates tokens, or any other failure, leaves the
  * session unsecured and working as before; pairing must never fail because this step did.
  * Only an explicit "token rejected" is reported as such.
+ *
+ * Accepted edge case: if the server stored the token but its reply was lost, this reports
+ * 'unsecured' and nothing is persisted, so a later restart presents a different token and is
+ * rejected until the session is paired again. Rare, and preferred over guessing.
  */
 export async function secureAfterPair(
   conn: { invoke: (method: string, ...args: unknown[]) => Promise<unknown> },

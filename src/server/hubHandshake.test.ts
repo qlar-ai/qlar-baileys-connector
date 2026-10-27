@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { newConnectorToken, registerWithHub, secureAfterPair, tokenToPresent } from './hubHandshake'
+import { newConnectorToken, registerWithHub, secureAfterPair, shouldPersistToken, tokenToPresent } from './hubHandshake'
 
 type Call = { method: string; args: unknown[] }
 
@@ -15,10 +15,10 @@ function fakeConn(behaviour: (method: string, args: unknown[]) => Promise<unknow
   }
 }
 
-test('registerWithHub_ServerAccepts_ReturnsOk', async () => {
+test('registerWithHub_Accepts_ReportsSecured', async () => {
   const conn = fakeConn(async () => undefined)
   const result = await registerWithHub(conn, 'sess-1', 'tok-1')
-  assert.equal(result, 'ok')
+  assert.equal(result, 'secured')
   assert.deepEqual(conn.calls, [{ method: 'ReconnectSecure', args: ['sess-1', 'tok-1'] }])
 })
 
@@ -30,7 +30,7 @@ test('registerWithHub_OldServerLacksMethod_FallsBackToReconnect', async () => {
     return undefined
   })
   const result = await registerWithHub(conn, 'sess-1', 'tok-1')
-  assert.equal(result, 'ok')
+  assert.equal(result, 'legacy')
   assert.deepEqual(conn.calls, [
     { method: 'ReconnectSecure', args: ['sess-1', 'tok-1'] },
     { method: 'Reconnect', args: ['sess-1'] },
@@ -126,3 +126,28 @@ test('secureAfterPair_OtherError_ReturnsNoToken_NoThrow', async () => {
   assert.ok(result.outcome === 'unsecured' && result.reason === 'error' && result.error === boom)
   assert.deepEqual(conn.calls.map((c) => c.method), ['ReconnectSecure'])
 })
+
+test('registerWithHub_OldServer_ReportsLegacy', async () => {
+  const conn = fakeConn(async (method) => {
+    if (method === 'ReconnectSecure') throw new Error('HubException: Method does not exist.')
+    return undefined
+  })
+  assert.equal(await registerWithHub(conn, 'sess-1', 'tok-1'), 'legacy')
+})
+
+test('shouldPersistToken_SecuredAndFresh_Persists', () => {
+  assert.equal(shouldPersistToken('secured', true), true)
+})
+
+test('shouldPersistToken_SecuredStoredToken_NothingNewToPersist', () => {
+  assert.equal(shouldPersistToken('secured', false), false)
+})
+
+for (const fresh of [true, false]) {
+  test(`shouldPersistToken_Legacy_Fresh${fresh}_NothingPersisted`, () => {
+    assert.equal(shouldPersistToken('legacy', fresh), false)
+  })
+  test(`shouldPersistToken_Rejected_Fresh${fresh}_NothingPersisted`, () => {
+    assert.equal(shouldPersistToken('rejected', fresh), false)
+  })
+}

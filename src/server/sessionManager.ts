@@ -77,6 +77,10 @@ export class SessionManager implements ControlManager {
     }
   }
 
+  isLive(sessionId: string): boolean {
+    return this.sessions.has(sessionId)
+  }
+
   /** The live session's connector token, or undefined when the session is not live or has none yet. */
   tokenFor(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.getConnectorToken()
