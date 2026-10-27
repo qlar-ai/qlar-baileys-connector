@@ -1,6 +1,7 @@
 import * as http from 'http'
 import pino, { Logger } from 'pino'
 import { SessionManager } from './sessionManager'
+import { readBodyLimited, PayloadTooLargeError, RequestTimeoutError } from './guards'
 
 const log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -50,7 +51,19 @@ async function handleRequest(
   }
 
   if (req.method === 'POST' && url === '/sessions') {
-    const body = await readBody(req)
+    let body: string
+    try {
+      body = await readBodyLimited(req, 4096, 10_000)
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        sendJson(res, 413, { error: 'request body too large' })
+      } else if (err instanceof RequestTimeoutError) {
+        sendJson(res, 408, { error: 'request timed out' })
+      } else {
+        log.warn({ err }, '[control] request body read failed')
+      }
+      return
+    }
     let code: string | undefined
     try {
       code = body ? (JSON.parse(body).code as string) : undefined
@@ -76,7 +89,18 @@ async function handleRequest(
 
   const deleteMatch = url.match(/^\/sessions\/([^/]+)$/)
   if (req.method === 'DELETE' && deleteMatch) {
-    await manager.stop(decodeURIComponent(deleteMatch[1]))
+    let sessionId: string
+    try {
+      sessionId = decodeURIComponent(deleteMatch[1])
+    } catch {
+      sendJson(res, 400, { error: 'invalid session id' })
+      return
+    }
+    if (!manager.isValidSessionId(sessionId)) {
+      sendJson(res, 400, { error: 'invalid session id' })
+      return
+    }
+    await manager.stop(sessionId)
     sendJson(res, 200, { ok: true })
     return
   }
@@ -93,14 +117,4 @@ function applyCors(res: http.ServerResponse): void {
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
-}
-
-function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
-    let data = ''
-    req.on('data', (chunk) => {
-      data += chunk
-    })
-    req.on('end', () => resolve(data))
-  })
 }

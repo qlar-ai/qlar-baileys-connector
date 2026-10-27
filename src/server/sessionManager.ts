@@ -3,6 +3,7 @@ import * as path from 'path'
 import pino, { Logger } from 'pino'
 import { ConnectorSession, SessionMeta } from './connectorSession'
 import { isLinked } from './waSession'
+import { resolveSessionDir } from './guards'
 
 /**
  * Holds every live tenant session in this process, keyed by sessionId. This is
@@ -79,7 +80,11 @@ export class SessionManager {
   }
 
   private wipe(sessionId: string): void {
-    const dir = path.join(this.dataRoot, sessionId)
+    const dir = resolveSessionDir(this.dataRoot, sessionId)
+    if (!dir) {
+      this.log.warn({ sessionId }, '[manager] refusing to wipe: session id does not resolve inside the data root')
+      return
+    }
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true })
   }
 
@@ -87,7 +92,13 @@ export class SessionManager {
   async restore(): Promise<void> {
     if (!fs.existsSync(this.dataRoot)) return
 
-    for (const sessionId of fs.readdirSync(this.dataRoot)) {
+    for (const entry of fs.readdirSync(this.dataRoot, { withFileTypes: true })) {
+      const sessionId = entry.name
+      // Only tenant directories with a safe name are sessions; anything else is left alone, never deleted.
+      if (!entry.isDirectory() || !resolveSessionDir(this.dataRoot, sessionId)) {
+        this.log.warn({ entry: sessionId }, '[manager] ignoring non-session entry in data root')
+        continue
+      }
       // Idempotent: never open a second socket for a session already live in
       // this process — duplicate connections for one account make WhatsApp 401.
       if (this.sessions.has(sessionId)) continue
@@ -135,6 +146,11 @@ export class SessionManager {
         }
       }
     }
+  }
+
+  /** True when the id maps to a directory strictly inside the data root. */
+  isValidSessionId(sessionId: string): boolean {
+    return resolveSessionDir(this.dataRoot, sessionId) !== null
   }
 
   list(): string[] {

@@ -14,7 +14,8 @@
     "bundle:dev": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector",
     "bundle:prod": "tsc --noEmit && node scripts/build.js https://wap-pusaka-messenger-prod.azurewebsites.net/hubs/connector",
     "build:exe:dev": "npm run bundle:dev && pkg dist-bundle/index.cjs --targets node24-win-x64,node24-linux-x64,node24-macos-x64 --output bin/dev/qlar-connector",
-    "build:exe:prod": "npm run bundle:prod && pkg dist-bundle/index.cjs --targets node24-win-x64,node24-linux-x64,node24-macos-x64 --output bin/prod/qlar-connector"
+    "build:exe:prod": "npm run bundle:prod && pkg dist-bundle/index.cjs --targets node24-win-x64,node24-linux-x64,node24-macos-x64 --output bin/prod/qlar-connector",
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",
@@ -35,6 +36,7 @@
     "@yao-pkg/pkg": "^6.21.0",
     "esbuild": "^0.28.1",
     "ts-node-dev": "^2.0.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.4.0"
   }
 }

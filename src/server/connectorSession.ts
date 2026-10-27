@@ -292,8 +292,8 @@ export class ConnectorSession {
     connection.on('Logout', async () => {
       this.log.info('[hub] Logout')
       await this.wa?.logout()
-      const id = this.sessionId ?? ''
-      this.handlers.onClosed(id)
+      const id = this.sessionId
+      if (id) this.handlers.onClosed(id)
       await this.stop()
     })
 
