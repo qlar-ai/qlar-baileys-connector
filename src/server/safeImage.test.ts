@@ -118,9 +118,57 @@ test('fetchPublicImage_Timeout_Throws', async () => {
 test('isPrivateAddress_Table', () => {
   const priv = ['0.0.0.0', '10.0.0.1', '127.0.0.1', '127.255.0.3', '169.254.169.254', '172.16.0.1', '172.31.255.255',
     '192.168.1.1', '100.64.0.1', '100.127.255.255', '::', '::1', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'febf::1',
-    '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', '0:0:0:0:0:ffff:192.168.0.1', 'not-an-ip']
+    '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', '0:0:0:0:0:ffff:192.168.0.1', 'not-an-ip',
+    '168.63.129.16', '198.18.0.1', '198.19.255.255', '192.0.2.1', '198.51.100.7', '203.0.113.9', '224.0.0.1', '239.1.1.1', '255.255.255.255',
+    '64:ff9b::a00:1', '64:ff9b::7f00:1', '2002:a00:1::1', '2002:7f00:1::', '::10.0.0.1', '::7f00:1']
   const pub = ['8.8.8.8', '93.184.216.34', '172.15.0.1', '172.32.0.1', '100.63.255.255', '100.128.0.1', '169.253.0.1',
-    '2606:4700:4700::1111', '2001:db8::1', '::ffff:8.8.8.8', '::ffff:808:808']
+    '2606:4700:4700::1111', '2001:db8::1', '::ffff:8.8.8.8', '::ffff:808:808', '64:ff9b::808:808', '2002:808:808::1', '::808:808', '198.17.255.255', '198.20.0.1', '168.63.129.17']
   for (const ip of priv) assert.equal(isPrivateAddress(ip), true, ip)
   for (const ip of pub) assert.equal(isPrivateAddress(ip), false, ip)
 })
+
+test('fetchPublicImage_MixedFamilies_PrefersIpv4', async () => {
+  let dialled = ''
+  await withServer((req, res) => { res.writeHead(200, { 'content-type': 'image/png' }); res.end(png) }, async (port) => {
+    await fetchPublicImage(`http://pub.example.com:${port}/a.png`, {
+      lookup: async () => ['2606:4700:4700::1111', PUBLIC_IP],
+      dialAddress: (ip) => { dialled = ip; return '127.0.0.1' },
+    })
+    assert.equal(dialled, PUBLIC_IP)
+  })
+})
+
+test('fetchPublicImage_MixedFamiliesOneIsPrivate_Throws', async () => {
+  await assert.rejects(fetchPublicImage('http://x.example.com/a.png', { lookup: async () => [PUBLIC_IP, 'fd00::1'] }), /private/i)
+})
+
+test('fetchPublicImage_LookupHangs_TimesOut', async () => {
+  await assert.rejects(
+    fetchPublicImage('http://x.example.com/a.png', { timeoutMs: 100, lookup: () => new Promise<string[]>(() => {}) }),
+    /timed out/i,
+  )
+})
+
+// A hostile endless body must not keep the socket open once we have decided not to read it.
+for (const [name, head] of [
+  ['Non200', { status: 404, headers: { 'content-type': 'image/png' } }],
+  ['Redirect', { status: 302, headers: { location: '/elsewhere' } }],
+  ['NonImage', { status: 200, headers: { 'content-type': 'text/html' } }],
+  ['DeclaredTooLarge', { status: 200, headers: { 'content-type': 'image/png', 'content-length': '999999' } }],
+] as const) {
+  test(`fetchPublicImage_${name}_EndlessBody_ClosesSocket`, async () => {
+    let closed!: () => void
+    const socketClosed = new Promise<void>((r) => (closed = r))
+    const iv: NodeJS.Timeout[] = []
+    await withServer((req, res) => {
+      req.socket.on('close', closed)
+      res.writeHead(head.status, head.headers)
+      iv.push(setInterval(() => { try { res.write(Buffer.alloc(64)) } catch {} }, 5))
+    }, async (port) => {
+      const opts = name === 'Redirect' ? { ...base, maxRedirects: 0 } : base
+      await assert.rejects(fetchPublicImage(`http://pub.example.com:${port}/a`, opts))
+      await Promise.race([socketClosed, new Promise((_, rej) => setTimeout(() => rej(new Error('socket still open')), 1000))])
+    })
+    iv.forEach(clearInterval)
+  })
+}

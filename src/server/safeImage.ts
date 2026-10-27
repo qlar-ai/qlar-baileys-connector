@@ -60,8 +60,13 @@ function parseV6(ip: string): number[] | null {
   return out.some(Number.isNaN) ? null : out
 }
 
-function privateV4([a, b, c]: number[]): boolean {
+function privateV4([a, b, c, d]: number[]): boolean {
   return (
+    (a === 168 && b === 63 && c === 129 && d === 16) || // Azure wireserver
+    (a === 198 && (b === 18 || b === 19)) || // benchmarking 198.18.0.0/15
+    (a === 192 && b === 0 && c === 2) || // TEST-NET-1
+    (a === 198 && b === 51 && c === 100) || // TEST-NET-2
+    (a === 203 && b === 0 && c === 113) || // TEST-NET-3
     a === 0 || a === 10 || a === 127 ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
@@ -79,14 +84,28 @@ export function isPrivateAddress(ip: string): boolean {
   const v6 = parseV6(ip)
   if (!v6) return true
   if (v6.every((g) => g === 0)) return true // ::
+  const v4Of = (hi: number, lo: number) => [hi >> 8, hi & 255, lo >> 8, lo & 255]
   if (v6.slice(0, 7).every((g) => g === 0) && v6[7] === 1) return true // ::1
   if ((v6[0] & 0xfe00) === 0xfc00) return true // fc00::/7
   if ((v6[0] & 0xffc0) === 0xfe80) return true // fe80::/10
   if ((v6[0] & 0xff00) === 0xff00) return true // multicast
   if (v6.slice(0, 5).every((g) => g === 0) && v6[5] === 0xffff) {
-    return privateV4([v6[6] >> 8, v6[6] & 255, v6[7] >> 8, v6[7] & 255]) // v4-mapped
+    return privateV4(v4Of(v6[6], v6[7])) // v4-mapped
   }
+  if (v6.slice(0, 6).every((g) => g === 0)) return privateV4(v4Of(v6[6], v6[7])) // v4-compatible ::a.b.c.d
+  if (v6[0] === 0x64 && v6[1] === 0xff9b && v6.slice(2, 6).every((g) => g === 0)) {
+    return privateV4(v4Of(v6[6], v6[7])) // NAT64 64:ff9b::/96
+  }
+  if (v6[0] === 0x2002) return privateV4(v4Of(v6[1], v6[2])) // 6to4
   return false
+}
+
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('Image download timed out')), Math.max(1, ms))
+  })
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
 }
 
 async function defaultLookup(host: string): Promise<string[]> {
@@ -116,11 +135,11 @@ export async function fetchPublicImage(
       throw new Error(`Unsupported URL scheme ${u.protocol}`)
     }
     const hostname = u.hostname.replace(/^\[|\]$/g, '')
-    const addresses = net.isIP(hostname) ? [hostname] : await lookup(hostname)
+    const addresses = net.isIP(hostname) ? [hostname] : await withDeadline(lookup(hostname), deadline - Date.now())
     if (addresses.length === 0) throw new Error(`Could not resolve ${hostname}`)
     if (addresses.some(isPrivateAddress)) throw new Error('Image host resolves to a private address')
 
-    const result = await requestOnce(u, hostname, addresses[0], opts.dialAddress, maxBytes, Math.max(1, deadline - Date.now()))
+    const result = await requestOnce(u, hostname, addresses.find((a) => net.isIPv4(a)) ?? addresses[0], opts.dialAddress, maxBytes, Math.max(1, deadline - Date.now()))
     if (result.redirect) {
       current = new URL(result.redirect, u).toString()
       continue
@@ -143,10 +162,13 @@ function requestOnce(
     const lib = isHttps ? https : http
     let settled = false
     let timer: NodeJS.Timeout | undefined
-    const done = (fn: () => void) => {
+    // Every outcome except a fully read body tears the connection down, so a hostile endless body
+    // cannot keep the socket open after we have decided not to read it.
+    const done = (fn: () => void, keepOpen = false) => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      if (!keepOpen) req.destroy()
       fn()
     }
     const req = lib.request(
@@ -189,19 +211,17 @@ function requestOnce(
           total += c.length
           if (total > maxBytes) {
             done(() => reject(new Error('Image too large')))
-            req.destroy()
             return
           }
           chunks.push(c)
         })
-        res.on('end', () => done(() => resolve({ buffer: Buffer.concat(chunks), mimeType })))
+        res.on('end', () => done(() => resolve({ buffer: Buffer.concat(chunks), mimeType }), true))
         res.on('error', (e) => done(() => reject(e)))
         res.on('aborted', () => done(() => reject(new Error('Image download aborted'))))
       },
     )
     timer = setTimeout(() => {
       done(() => reject(new Error('Image download timed out')))
-      req.destroy()
     }, timeoutMs)
     req.on('error', (e) => done(() => reject(e)))
     req.end()
