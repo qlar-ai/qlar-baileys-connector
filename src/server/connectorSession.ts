@@ -3,6 +3,8 @@ import * as signalR from '@microsoft/signalr'
 import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
+import { afterHandshake, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
+import { resolveSessionDir } from './guards'
 
 /**
  * How long a freshly paired session may sit showing QR codes nobody scans before it is given up.
@@ -74,6 +76,13 @@ export interface SessionMeta {
   sessionId: string
   agentId: string
   hubUrl: string
+  /** Proves to Messenger-BE that this connector owns the session. Absent in meta.json from before tokens. */
+  connectorToken?: string
+  /**
+   * A self-generated token presented to the hub but not yet confirmed. Reused on every handshake
+   * until the hub answers; never used as the DELETE bearer or upload header. Absent in older files.
+   */
+  pendingConnectorToken?: string
 }
 
 export interface ConnectorSessionHandlers {
@@ -81,6 +90,10 @@ export interface ConnectorSessionHandlers {
   onRegistered: (meta: SessionMeta) => void
   /** Called when the session is finished for good — logged out, or a pairing nobody completed. */
   onClosed: (sessionId: string) => void
+  /** Called when the session generated its own token and the hub accepted it, so it can be persisted. */
+  onToken: (sessionId: string, token: string) => void
+  /** Called before a newly generated token is first presented, so it survives a restart as pending. */
+  onPendingToken: (sessionId: string, token: string) => void
 }
 
 /**
@@ -102,21 +115,81 @@ export class ConnectorSession {
   // When this session started waiting for its first QR scan; null once WhatsApp has linked it,
   // and for restored sessions, which only come back when they were already linked.
   private unlinkedSince: number | null = null
+  // The per-session token presented to the hub and on uploads. Never logged.
+  private connectorToken: string | undefined
+  // Generated and presented but not yet confirmed by the hub; never used as a credential here.
+  private pendingToken: string | undefined
+  // Set when the hub rejected our token: the session stays idle (no retry, no WhatsApp) until re-paired.
+  private blocked = false
   private readonly log: Logger
 
   constructor(
     private readonly hubUrl: string,
     private readonly dataRoot: string,
-    private readonly opts: { code?: string; sessionId?: string; agentId?: string },
+    private readonly opts: {
+      code?: string
+      sessionId?: string
+      agentId?: string
+      connectorToken?: string
+      pendingConnectorToken?: string
+    },
     private readonly handlers: ConnectorSessionHandlers,
   ) {
     this.sessionId = opts.sessionId ?? null
     this.agentId = opts.agentId ?? ''
+    this.connectorToken = opts.connectorToken || undefined
+    this.pendingToken = opts.pendingConnectorToken || undefined
     this.log = pino({ level: process.env.LOG_LEVEL ?? 'info' }).child({ session: opts.sessionId ?? 'pairing' })
   }
 
   getSessionId(): string | null {
     return this.sessionId
+  }
+
+  /** The token this session presents, or undefined when it has none yet. */
+  getConnectorToken(): string | undefined {
+    return this.connectorToken
+  }
+
+  /**
+   * Re-register with the hub, presenting this session's token (or a freshly generated one, which is
+   * persisted once the hub accepts it). Returns false when the hub rejected the token: the session
+   * is then blocked and torn down to idle - never retried, so a mismatch cannot loop against the hub.
+   */
+  private async handshake(connection: signalR.HubConnection): Promise<boolean> {
+    if (!this.sessionId) return false
+    const sessionId = this.sessionId
+    const next = nextTokenToPresent(this.connectorToken, this.pendingToken)
+    if (next.shouldPersistPending) {
+      // Remembered before it is shown to the hub, so a lost reply or a restart re-presents the same token.
+      this.pendingToken = next.token
+      this.handlers.onPendingToken(sessionId, next.token)
+    }
+    const result = await registerWithHub(connection, sessionId, next.token)
+
+    if (result === 'rejected') {
+      if (!this.blocked) {
+        this.log.error('[hub] connector token rejected - session left idle until it is paired again')
+      }
+      this.blocked = true
+      await this.stop()
+      return false
+    }
+
+    // Only a token the server really registered is kept; after a legacy Reconnect the session stays
+    // unsecured exactly as before tokens (no header, revocable without a bearer); the pending token is
+    // kept for when the server is upgraded, but never used as a credential.
+    if (afterHandshake(result, next.token === this.connectorToken).promote) {
+      this.connectorToken = next.token
+      this.pendingToken = undefined
+      this.handlers.onToken(sessionId, next.token)
+    }
+    return true
+  }
+
+  /** Header proving ownership of the session on the HTTP upload endpoints, when there is a token. */
+  private uploadHeaders(): Record<string, string> | undefined {
+    return this.connectorToken ? { 'X-Connector-Token': this.connectorToken } : undefined
   }
 
   private sessionDir(): string {
@@ -292,15 +365,15 @@ export class ConnectorSession {
     connection.on('Logout', async () => {
       this.log.info('[hub] Logout')
       await this.wa?.logout()
-      const id = this.sessionId ?? ''
-      this.handlers.onClosed(id)
+      const id = this.sessionId
+      if (id) this.handlers.onClosed(id)
       await this.stop()
     })
 
     connection.onreconnected(async () => {
-      if (!this.sessionId) return
+      if (!this.sessionId || this.blocked) return
       try {
-        await connection.invoke('Reconnect', this.sessionId)
+        if (!(await this.handshake(connection))) return
         // Re-declared on every reconnect, not just at startup. Messenger-BE drops the
         // session's in-memory status when the connection goes, so a transport blip would
         // otherwise leave it reporting this channel as self-hosted — and the CMS would
@@ -318,7 +391,7 @@ export class ConnectorSession {
 
     if (this.sessionId) {
       // Restored session — re-register straight away.
-      await connection.invoke('Reconnect', this.sessionId)
+      if (!(await this.handshake(connection))) return
       await this.declareHosted()
       await this.declareVoiceSupport()
       await this.declareImageSupport()
@@ -448,6 +521,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-image`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -519,6 +593,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-document`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -588,6 +663,7 @@ export class ConnectorSession {
 
       const response = await fetch(`${this.apiBaseUrl()}/api/baileys/${this.sessionId}/inbound-audio`, {
         method: 'POST',
+        headers: this.uploadHeaders(),
         body: form,
       })
 
@@ -669,10 +745,44 @@ export class ConnectorSession {
     if (!this.opts.code) throw new Error('no pairing code and no sessionId')
 
     const result = await this.connection.invoke<{ sessionId: string; agentId: string }>('Pair', this.opts.code)
+    // Defence in depth: the id names a directory under dataRoot, so its shape is never trusted.
+    if (!resolveSessionDir(this.dataRoot, result?.sessionId ?? '')) {
+      throw new Error('Pair returned an unsafe session id - refusing to use it')
+    }
     this.sessionId = result.sessionId
     this.agentId = result.agentId
-    this.log.info({ sessionId: this.sessionId }, '[hub] paired')
-    this.handlers.onRegistered({ sessionId: this.sessionId, agentId: this.agentId, hubUrl: this.hubUrl })
+
+    // Secure the session on this same connection with a token of our own. Only a successful step
+    // yields a token to persist; an old Messenger-BE or a transient failure leaves the session
+    // unsecured (exactly as before tokens), and only an explicit rejection stops the pairing.
+    // On a transient failure the server may have stored the token anyway (a lost reply), so it is kept
+    // as pending and re-presented at the next handshake instead of a new one.
+    const secured = await secureAfterPair(this.connection, this.sessionId)
+    if (secured.outcome === 'rejected') {
+      if (!this.blocked) {
+        this.log.error({ sessionId: this.sessionId }, '[hub] connector token rejected right after pairing - not starting WhatsApp')
+      }
+      this.blocked = true
+      // Thrown so the pairing request reports failure and the manager discards this session; nothing retries.
+      throw new Error('Connector token rejected after pairing')
+    }
+    if (secured.outcome === 'secured') {
+      this.connectorToken = secured.token
+    } else if (secured.reason === 'error') {
+      this.pendingToken = secured.token
+      this.log.warn({ err: secured.error }, '[hub] securing the session after pairing failed - continuing unsecured')
+    } else {
+      this.log.info('[hub] Messenger-BE predates connector tokens - session left unsecured')
+    }
+
+    this.log.info({ sessionId: this.sessionId, secured: this.connectorToken !== undefined }, '[hub] paired')
+    this.handlers.onRegistered({
+      sessionId: this.sessionId,
+      agentId: this.agentId,
+      hubUrl: this.hubUrl,
+      connectorToken: this.connectorToken,
+      pendingConnectorToken: this.pendingToken,
+    })
     await this.declareHosted()
     await this.declareVoiceSupport()
     await this.declareImageSupport()
@@ -695,7 +805,7 @@ export class ConnectorSession {
   }
 
   private initWa(): void {
-    if (this.waStarted || !this.sessionId) return
+    if (this.waStarted || !this.sessionId || this.blocked) return
     this.waStarted = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
