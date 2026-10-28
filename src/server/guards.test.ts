@@ -5,7 +5,7 @@ import * as os from 'os'
 import * as path from 'path'
 import { EventEmitter } from 'events'
 import type * as http from 'http'
-import { resolveSessionDir, readBodyLimited, PayloadTooLargeError, RequestTimeoutError } from './guards'
+import { isIgnorableJid, resolveSessionDir, readBodyLimited, PayloadTooLargeError, RequestTimeoutError } from './guards'
 
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'guards-'))
 const fakeReq = () => Object.assign(new EventEmitter(), { destroy() { throw new Error('readBodyLimited must not destroy the request') }, pause() {} }) as unknown as http.IncomingMessage & EventEmitter
@@ -42,4 +42,16 @@ test('readBodyLimited_Aborted_Rejects', async () => {
   const p = readBodyLimited(req, 100, 1000)
   req.emit('aborted')
   await assert.rejects(p)
+})
+
+test('isIgnorableJid_StatusBroadcast_True', () => { assert.equal(isIgnorableJid('status@broadcast'), true) })
+test('isIgnorableJid_OtherBroadcastList_True', () => { assert.equal(isIgnorableJid('1234567890@broadcast'), true) })
+test('isIgnorableJid_Newsletter_True', () => { assert.equal(isIgnorableJid('120363012345678901@newsletter'), true) })
+test('isIgnorableJid_PhoneJid_False', () => { assert.equal(isIgnorableJid('6281234567890@s.whatsapp.net'), false) })
+test('isIgnorableJid_LidJid_False', () => { assert.equal(isIgnorableJid('123456789012345@lid'), false) })
+test('isIgnorableJid_GroupJid_False', () => { assert.equal(isIgnorableJid('120363012345678901@g.us'), false) })
+test('isIgnorableJid_Null_False', () => {
+  assert.equal(isIgnorableJid(null), false)
+  assert.equal(isIgnorableJid(undefined), false)
+  assert.equal(isIgnorableJid(''), false)
 })

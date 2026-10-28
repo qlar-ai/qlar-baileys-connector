@@ -71,3 +71,13 @@ export function readBodyLimited(req: http.IncomingMessage, maxBytes: number, tim
     req.on('close', onClose)
   })
 }
+
+/**
+ * True for chats that are never a conversation with a person: the status feed (`status@broadcast`),
+ * any broadcast list (`@broadcast`) and channels (`@newsletter`). Only the chat's own `remoteJid`
+ * decides; DMs (`@s.whatsapp.net`, `@lid`) and groups (`@g.us`) are never ignorable.
+ */
+export function isIgnorableJid(jid: string | null | undefined): boolean {
+  if (typeof jid !== 'string' || jid === '') return false
+  return jid.endsWith('@broadcast') || jid.endsWith('@newsletter')
+}

@@ -165,3 +165,16 @@ test('register_UnsafeSessionIdFromPair_Throws_WritesNothing', async () => {
   assert.ok(!fs.existsSync(path.join(dataRoot, 'meta.json')))
   assert.equal(manager.count(), 0)
 })
+
+test('restore_SessionStillRetryingHub_StaysOnceInMap_CountedAndDeletable', async () => {
+  // start() resolves while the real session keeps retrying the hub in the background.
+  const s = setupWithMeta({ sessionId: 'retrying-1', agentId: 'a', hubUrl: 'h' })
+  await s.manager.restore()
+  await s.manager.restore() // idempotent: no second session for the same id
+  assert.equal(created.length, 1)
+  assert.equal(s.manager.count(), 1)
+  assert.equal(s.manager.isLive('retrying-1'), true)
+  await s.manager.stop('retrying-1')
+  assert.equal(s.manager.count(), 0)
+  assert.ok(!fs.existsSync(s.dir))
+})
