@@ -29,9 +29,7 @@ connector and shows the QR code to scan.
 **Docker**
 
 ```bash
-echo QLAR_HUB_URL=<address from the CMS> >> .env
-echo QLAR_PAIRING_CODE=<code from the CMS> >> .env
-docker run -d --name qlar-connector --restart unless-stopped --env-file .env -v qlar-connector-state:/state ghcr.io/qlar-ai/qlar-connector:<version> enroll
+docker run -d --name qlar-connector --restart unless-stopped -e QLAR_HUB_URL=<address from the CMS> -e QLAR_PAIRING_CODE=<code from the CMS> -v qlar-connector-state:/state ghcr.io/qlar-ai/qlar-connector:<version> enroll
 docker logs -f qlar-connector
 ```
 
@@ -93,7 +91,7 @@ sha256sum -c qlar-connector.sha256
 
 | You see | Do this |
 |---|---|
-| `The pairing code is invalid or has expired` | Create a new code in the CMS and run the command again. |
+| `The pairing code is invalid or has expired` | Create a new code in the CMS and run the new command. With Docker, remove the old container first (`docker rm -f qlar-connector`), or the name is already taken. The container stays up and prints this message instead of restarting in a loop. |
 | `Could not reach the Qlar hub at ...` | Check that this machine can make outbound HTTPS connections to that address. |
 | `Node 24 or newer is required` | Upgrade Node.js, or use the Docker install. |
 | `Nothing is enrolled in this state directory` | You ran `run` before `enroll`, or you are in a different folder or volume. Run `enroll` with a code. |
