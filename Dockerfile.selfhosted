@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+#
+# The connector a customer runs on their own machine: one WhatsApp number, outbound connections
+# only. Started from the install lines in the Qlar CMS:
+#   docker run ... ghcr.io/qlar-ai/qlar-connector:<version> enroll
+# The hosted multi-session server uses ./Dockerfile instead.
+
+# ---------- build stage ----------
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
+COPY src ./src
+RUN npm run build
+
+# ---------- runtime stage ----------
+FROM node:24-slim AS runtime
+WORKDIR /app
+
+ARG VERSION=dev
+ENV NODE_ENV=production \
+    CONNECTOR_DATA_DIR=/state \
+    CONNECTOR_VERSION=$VERSION
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+
+# The paired session lives on this volume so it survives container upgrades and restarts.
+RUN mkdir -p /state && chown -R node:node /state
+VOLUME ["/state"]
+
+USER node
+
+# The connector listens on no port: there is deliberately no EXPOSE.
+ENTRYPOINT ["node", "dist/selfhosted/main.js"]
+CMD ["run"]

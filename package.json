@@ -1,7 +1,7 @@
 {
   "name": "qlar-connector",
-  "version": "1.0.0",
-  "description": "QLAR WhatsApp connector \u2014 runs on user's machine, bridges Baileys to Messenger-BE via SignalR",
+  "version": "1.1.0",
+  "description": "QLAR WhatsApp connector: runs on your own machine and bridges Baileys to Qlar. One number per state directory, outbound connections only.",
   "main": "dist/selfhosted/main.js",
   "engines": {
     "node": ">=24"
@@ -12,6 +12,7 @@
     "start": "node dist/selfhosted/main.js",
     "start:server": "node dist/server/main.js",
     "build": "tsc",
+    "bundle": "tsc --noEmit && node scripts/build.js",
     "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
