@@ -9,12 +9,18 @@ export type ManagerLike = {
   count(): number
 }
 
-/** True when the state directory already holds a paired session (a `<sessionId>/meta.json`). */
-export function hasEnrolledSession(stateDir: string): boolean {
+/**
+ * True when the state directory holds a session that is linked to WhatsApp. `meta.json` alone is
+ * not enough: Pair writes it before anyone has scanned, and a restart wipes such a half-made
+ * session. `isLinked` is the same test SessionManager.restore applies, passed in so this module
+ * does not import Baileys.
+ */
+export function hasEnrolledSession(stateDir: string, isLinked: (sessionDir: string) => boolean): boolean {
   if (!fs.existsSync(stateDir)) return false
-  return fs
-    .readdirSync(stateDir, { withFileTypes: true })
-    .some((entry) => entry.isDirectory() && fs.existsSync(path.join(stateDir, entry.name, 'meta.json')))
+  return fs.readdirSync(stateDir, { withFileTypes: true }).some((entry) => {
+    const dir = path.join(stateDir, entry.name)
+    return entry.isDirectory() && fs.existsSync(path.join(dir, 'meta.json')) && isLinked(dir)
+  })
 }
 
 /**

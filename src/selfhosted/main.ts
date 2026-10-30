@@ -1,7 +1,8 @@
+import * as fs from 'fs'
 import pino from 'pino'
 import { hasEnrolledSession, runEnroll, runRestore } from './enroll'
 import { parseCommand, UsageError } from './options'
-import { assertNodeVersion, connectorVersion, describeFailure } from './runtime'
+import { assertNodeVersion, connectorVersion, describeFailure, isCodeRejection } from './runtime'
 
 // The connector a customer runs on their own machine: one number, outbound connections only.
 // Unlike the hosted server it opens no HTTP port, so nothing on this machine can be asked to
@@ -20,12 +21,18 @@ async function main(): Promise<void> {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
   }
 
+  // Stop promptly when the container is stopped (PID 1 ignores SIGTERM unless it handles it).
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => process.exit(0))
+
   // Loaded only now: on a Node that is too old the dependencies can fail to import with an obscure
   // error, and the version check above must be what the operator reads.
   const { SessionManager } = await import('../server/sessionManager')
+  const { isLinked } = await import('../server/waSession')
   const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
-  const manager = new SessionManager(command.hubUrl, command.stateDir)
-  const enrolled = hasEnrolledSession(command.stateDir)
+  // Not hosted: a session on the customer's own machine must not declare itself to the hub, or it
+  // would be labelled "public server" and become eligible for the idle sweep.
+  const manager = new SessionManager(command.hubUrl, command.stateDir, false)
+  const enrolled = hasEnrolledSession(command.stateDir, isLinked)
   logger.info({ version: connectorVersion(process.env), stateDir: command.stateDir }, `[connector] ${command.kind}`)
 
   try {
@@ -36,11 +43,16 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     if (err instanceof UsageError) throw err
-    throw new Error(describeFailure(err, command.hubUrl))
+    const message = describeFailure(err, command.hubUrl)
+    // A container that exits is restarted by `--restart unless-stopped` and would retry the same
+    // spent code forever. Stay up and say what to do instead; the operator removes the container.
+    if (isCodeRejection(err) && fs.existsSync('/.dockerenv')) {
+      console.error(message)
+      setInterval(() => undefined, 60 * 60 * 1000)
+      return
+    }
+    throw new Error(message)
   }
-
-  // The sessions' sockets keep the process alive; stop promptly when the container is stopped.
-  for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => process.exit(0))
 }
 
 main().catch((err) => {

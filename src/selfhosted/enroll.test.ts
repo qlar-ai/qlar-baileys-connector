@@ -18,18 +18,29 @@ function fakeManager() {
   return { manager, calls }
 }
 
-test('hasEnrolledSession_EmptyDir_False', () => assert.equal(hasEnrolledSession(tmp()), false))
-test('hasEnrolledSession_MissingDir_False', () => assert.equal(hasEnrolledSession(path.join(tmp(), 'nope')), false))
-test('hasEnrolledSession_SubdirWithMeta_True', () => {
+const linked = () => true
+const unlinked = () => false
+
+test('hasEnrolledSession_EmptyDir_False', () => assert.equal(hasEnrolledSession(tmp(), linked), false))
+test('hasEnrolledSession_MissingDir_False', () => assert.equal(hasEnrolledSession(path.join(tmp(), 'nope'), linked), false))
+test('hasEnrolledSession_LinkedSubdirWithMeta_True', () => {
   const root = tmp()
   fs.mkdirSync(path.join(root, 'abc'))
   fs.writeFileSync(path.join(root, 'abc', 'meta.json'), '{}')
-  assert.equal(hasEnrolledSession(root), true)
+  assert.equal(hasEnrolledSession(root, linked), true)
 })
 test('hasEnrolledSession_SubdirWithoutMeta_False', () => {
   const root = tmp()
   fs.mkdirSync(path.join(root, 'abc'))
-  assert.equal(hasEnrolledSession(root), false)
+  assert.equal(hasEnrolledSession(root, linked), false)
+})
+// Pair writes meta.json before anyone has scanned. A restart then wipes that half-made session,
+// so it must not count as enrolled: the spent code would be ignored and the container left idle.
+test('hasEnrolledSession_SessionNeverLinkedToWhatsApp_False', () => {
+  const root = tmp()
+  fs.mkdirSync(path.join(root, 'abc'))
+  fs.writeFileSync(path.join(root, 'abc', 'meta.json'), '{}')
+  assert.equal(hasEnrolledSession(root, unlinked), false)
 })
 
 test('runEnroll_EnrolledWithSpentCode_RestoresAndDoesNotStartFromCode', async () => {

@@ -14,11 +14,18 @@ export function assertNodeVersion(version: string, minMajor = 24): void {
   }
 }
 
+const CODE_REJECTED = /invalid|expired/i
+
+/** True when the hub refused the pairing code itself (as opposed to being unreachable). */
+export function isCodeRejection(err: unknown): boolean {
+  return CODE_REJECTED.test(err instanceof Error ? err.message : String(err))
+}
+
 /** What the operator reads when `enroll` fails, with the next thing to try. */
 export function describeFailure(err: unknown, hubUrl: string): string {
   const message = err instanceof Error ? err.message : String(err)
-  if (/invalid|expired/i.test(message)) {
-    return 'The pairing code is invalid or has expired. Create a new code in the Qlar CMS and run the command again.'
+  if (isCodeRejection(err)) {
+    return 'The pairing code is invalid or has expired. Create a new code in the Qlar CMS, then run the new command. With Docker, remove the old container first: docker rm -f qlar-connector'
   }
   if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|negotiation|Failed to (start|complete)/i.test(message)) {
     return `Could not reach the Qlar hub at ${hubUrl}. Check this machine's outbound HTTPS access. (${message})`
