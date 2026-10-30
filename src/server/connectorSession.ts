@@ -152,6 +152,12 @@ export class ConnectorSession {
       agentId?: string
       connectorToken?: string
       pendingConnectorToken?: string
+      /**
+       * Whether this runs on the hosted server (the default). Only a hosted session declares itself
+       * to the hub: that flag makes a channel eligible for the idle sweep and labels it "public
+       * server". A connector a customer runs on their own machine passes false.
+       */
+      hosted?: boolean
     },
     private readonly handlers: ConnectorSessionHandlers,
   ) {
@@ -582,9 +588,8 @@ export class ConnectorSession {
    * Tell Messenger-BE this session lives on the hosted server, so it is eligible for the
    * idle sweep that revokes abandoned pairings.
    *
-   * Only this class calls it — `hub.ts`, the single-session connector customers run on
-   * their own machines, never does, which is what keeps self-hosted sessions out of the
-   * sweep. Sent as its own call rather than an extra argument on Pair/Reconnect so older
+   * Skipped when the session was created with `hosted: false` (the connector a customer runs
+   * on their own machine), which is what keeps self-hosted sessions out of the sweep. Sent as its own call rather than an extra argument on Pair/Reconnect so older
    * connectors keep working: SignalR matches hub methods by name and arity, and widening
    * either signature would break every client that has not been redeployed.
    *
@@ -592,7 +597,7 @@ export class ConnectorSession {
    * next reconnect re-declares it — far better than refusing to serve messages.
    */
   private async declareHosted(): Promise<void> {
-    if (!this.sessionId) return
+    if (!this.sessionId || this.opts.hosted === false) return
 
     try {
       await this.hubInvoke(this.connection, 'DeclareHosted', this.sessionId)

@@ -1,0 +1,74 @@
+# Publishes a connector release when a version tag is pushed:
+#   - the Docker image ghcr.io/qlar-ai/qlar-connector:<version>  (never :latest: the Qlar CMS pins a version)
+#   - qlar-connector.cjs, the single-file bundle for `node qlar-connector.cjs`, with its SHA-256
+#
+# The tag must equal the version in package.json.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Check the tag matches the package version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag v$TAG does not match package.json version $VERSION"; exit 1
+          fi
+          echo "number=$TAG" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Build the bundle and its checksum
+        run: |
+          npm run bundle
+          cp dist-bundle/qlar-connector.cjs .
+          sha256sum qlar-connector.cjs > qlar-connector.sha256
+          cat qlar-connector.sha256
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.selfhosted
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.number }}
+          tags: |
+            ghcr.io/qlar-ai/qlar-connector:${{ steps.version.outputs.number }}
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            qlar-connector.cjs
+            qlar-connector.sha256
+          generate_release_notes: true

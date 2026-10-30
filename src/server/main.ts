@@ -1,6 +1,7 @@
 import pino, { Logger } from 'pino'
 import { SessionManager } from './sessionManager'
 import { startControlServer } from './controlServer'
+import { requireHubUrl } from './config'
 
 const logger: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -9,10 +10,13 @@ const logger: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 //   HUB_URL             — Messenger-BE SignalR hub the connectors register with
 //   CONNECTOR_DATA_DIR  — where per-tenant state lives (mount a volume here)
 //   PORT                — HTTP control API port
-const HUB_URL =
-  process.env.HUB_URL ??
-  process.env.MESSENGER_BE_HUB_URL ??
-  'https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector'
+let HUB_URL: string
+try {
+  HUB_URL = requireHubUrl(process.env)
+} catch (err) {
+  logger.error({ err }, '[server] refusing to start without a hub URL')
+  process.exit(1)
+}
 const DATA_DIR = process.env.CONNECTOR_DATA_DIR ?? './data'
 const PORT = Number(process.env.PORT ?? process.env.CONTROL_PORT ?? 8080)
 

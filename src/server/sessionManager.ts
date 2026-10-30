@@ -18,7 +18,16 @@ export class SessionManager implements ControlManager {
   private readonly sessions = new Map<string, ConnectorSession>()
   private readonly log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
-  constructor(private readonly hubUrl: string, private readonly dataRoot: string) {
+  /**
+   * `hosted` is true for the multi-tenant server and false for the connector a customer runs on
+   * their own machine: only hosted sessions declare themselves to the hub (idle sweep, "public
+   * server" label).
+   */
+  constructor(
+    private readonly hubUrl: string,
+    private readonly dataRoot: string,
+    private readonly hosted: boolean = true,
+  ) {
     fs.mkdirSync(this.dataRoot, { recursive: true })
   }
 
@@ -27,7 +36,7 @@ export class SessionManager implements ControlManager {
     const session = new ConnectorSession(
       this.hubUrl,
       this.dataRoot,
-      { code },
+      { code, hosted: this.hosted },
       {
         onRegistered: (meta) => this.register(meta, session),
         onClosed: (sessionId) => this.remove(sessionId),
@@ -181,6 +190,7 @@ export class SessionManager implements ControlManager {
             // Both absent in meta.json written before tokens; the session then generates one.
             connectorToken: nonEmptyString(meta.connectorToken),
             pendingConnectorToken: nonEmptyString(meta.pendingConnectorToken),
+            hosted: this.hosted,
           },
           {
             onRegistered: (m) => this.register(m, restored),

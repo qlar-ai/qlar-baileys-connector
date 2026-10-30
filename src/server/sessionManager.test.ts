@@ -14,7 +14,7 @@ type FakeHandlers = {
   onToken: (id: string, t: string) => void
   onPendingToken: (id: string, t: string) => void
 }
-type FakeOpts = { code?: string; sessionId?: string; agentId?: string; connectorToken?: string; pendingConnectorToken?: string }
+type FakeOpts = { code?: string; sessionId?: string; agentId?: string; connectorToken?: string; pendingConnectorToken?: string; hosted?: boolean }
 const created: FakeSession[] = []
 class FakeSession {
   constructor(public hubUrl: string, public dataRoot: string, public opts: FakeOpts, public handlers: FakeHandlers) {
@@ -177,4 +177,25 @@ test('restore_SessionStillRetryingHub_StaysOnceInMap_CountedAndDeletable', async
   await s.manager.stop('retrying-1')
   assert.equal(s.manager.count(), 0)
   assert.ok(!fs.existsSync(s.dir))
+})
+
+// A session only declares itself hosted (idle sweep, "public server" label) when its manager says so.
+test('startFromCode_DefaultManager_SessionIsHosted', async () => {
+  const s = setupWithMeta({ sessionId: 'h-1', agentId: 'a', hubUrl: 'h' })
+  created.length = 0
+  await s.manager.startFromCode('CODE')
+  assert.equal(created[0].opts.hosted, true)
+})
+test('startFromCode_SelfHostedManager_SessionIsNotHosted', async () => {
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-self-'))
+  created.length = 0
+  await new SessionManager('http://localhost/hub', dataRoot, false).startFromCode('CODE')
+  assert.equal(created[0].opts.hosted, false)
+})
+test('restore_SelfHostedManager_RestoredSessionIsNotHosted', async () => {
+  const s = setupWithMeta({ sessionId: 'self-1', agentId: 'a', hubUrl: 'h' })
+  const manager = new SessionManager('http://localhost/hub', s.dataRoot, false)
+  created.length = 0
+  await manager.restore()
+  assert.equal(created[0].opts.hosted, false)
 })

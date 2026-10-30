@@ -1,11 +1,9 @@
 const esbuild = require('esbuild')
 const fs = require('fs')
 
-const hubUrl = process.argv[2]
-if (!hubUrl) {
-  console.error('Usage: node scripts/build.js <hub-url>')
-  process.exit(1)
-}
+// One bundle serves every environment: the hub URL is given on the command line when the
+// connector runs, never baked in here.
+const { version } = require('../package.json')
 
 // @microsoft/signalr resolves its Node-only deps (ws, eventsource,
 // tough-cookie, node-fetch, fetch-cookie, abort-controller) via a
@@ -33,13 +31,13 @@ const patchSignalRDynamicRequire = {
 
 esbuild
   .build({
-    entryPoints: ['src/index.ts'],
+    entryPoints: ['src/selfhosted/main.ts'],
     bundle: true,
     platform: 'node',
-    target: 'node22',
+    target: 'node24',
     format: 'cjs',
-    outfile: 'dist-bundle/index.cjs',
-    define: { 'process.env.CONNECTOR_HUB_URL': JSON.stringify(hubUrl) },
+    outfile: 'dist-bundle/qlar-connector.cjs',
+    define: { __CONNECTOR_VERSION__: JSON.stringify(version) },
     plugins: [patchSignalRDynamicRequire],
   })
   .catch(() => process.exit(1))

@@ -1,16 +1,15 @@
 # Deploys the hosted multi-session connector server (src/server/main.ts) to Azure App Service.
 #
-#   push to dev  → wap-pusaka-wa-connector-dev   (GitHub environment "development")
-#   push to main → wap-pusaka-wa-connector-prod  (GitHub environment "production")
+#   push to dev  -> the development App Service   (GitHub environment "development")
+#   push to main -> the production App Service    (GitHub environment "production")
 #
-# Same mechanics as the manual steps in docs/DEPLOY.md: `git archive` of the commit, zip-deployed,
-# and compiled on Azure by Oryx (SCM_DO_BUILD_DURING_DEPLOYMENT=true). Tenant state lives in
-# /home/data, outside wwwroot, so a deploy does not wipe paired sessions — but the restart does
-# drop and reconnect every WhatsApp socket, which is why only changes to the server's code trigger it.
+# `git archive` of the commit is zip-deployed and compiled on Azure by Oryx
+# (SCM_DO_BUILD_DURING_DEPLOYMENT=true). Tenant state lives outside wwwroot, so a deploy does not
+# wipe paired sessions - but the restart drops and reconnects every WhatsApp socket, which is why
+# only changes to the server's code trigger it.
 #
-# Azure sign-in is OIDC (no stored secret): each environment carries the client id of a managed
-# identity that may deploy to that one app only. SCM basic auth is off on both apps, so a publish
-# profile would not work anyway. One-time setup: docs/DEPLOY.md → "CI/CD (GitHub Actions)".
+# Azure sign-in is OIDC (no stored secret): each GitHub environment carries the client id of a
+# managed identity that may deploy to its own app only.
 
 name: Deploy hosted connector
 
@@ -51,7 +50,7 @@ jobs:
       - run: npm ci
 
       # The App Service startup command is `node dist/server/main.js`. A commit without the server
-      # sources deploys fine and then drops every tenant — see docs/DEPLOY.md "Check first".
+      # sources deploys fine and then drops every tenant.
       - name: Check the hosted server sources are present
         run: test -f src/server/main.ts || { echo "::error::src/server/main.ts is missing — refusing to deploy"; exit 1; }
 
