@@ -1,6 +1,8 @@
 import * as http from 'http'
+import * as path from 'path'
+import { timingSafeEqual } from 'crypto'
 import pino, { Logger } from 'pino'
-import { SessionManager } from './sessionManager'
+import { readBodyLimited, PayloadTooLargeError, RequestTimeoutError, resolveSessionDir } from './guards'
 
 const log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -8,26 +10,64 @@ const log: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
  * Tiny HTTP control API the platform (CMS-Web / CMS-BE) calls to provision and
  * tear down tenant sessions on this hosted connector server.
  *
- *   POST   /sessions        { code }   → start a new tenant (Pair with the code)
- *   DELETE /sessions/:id                → stop + wipe a tenant
- *   GET    /sessions                    → list live sessionIds
+ *   POST   /sessions        { code }   → start a new tenant (Pair with the code; the code is the credential)
+ *   DELETE /sessions/:id                → stop + wipe a tenant; requires `Authorization: Bearer <session token>`
+ *                                         (secured sessions only; unsecured ones are revoked as before)
+ *   GET    /sessions                    → { count } only - never the tenant ids
  *   GET    /health                      → liveness + session count
  */
-export function startControlServer(manager: SessionManager, port: number): void {
-  const server = http.createServer((req, res) => {
-    handleRequest(req, res, manager).catch((err) => {
+export interface ControlManager {
+  count(): number
+  /** True when the session is live in this process (with or without a token). */
+  isLive(sessionId: string): boolean
+  startFromCode(code: string): Promise<void>
+  tokenFor(sessionId: string): string | undefined
+  stop(sessionId: string): Promise<void>
+}
+
+/**
+ * Session ids are checked for shape with the same guard the manager uses before it wipes a
+ * directory. The guard only depends on the id (no separators, not '.' / '..'), so any root works.
+ */
+const ID_CHECK_ROOT = path.resolve('session-id-check')
+
+function isSafeSessionId(sessionId: string): boolean {
+  return resolveSessionDir(ID_CHECK_ROOT, sessionId) !== null
+}
+
+/** Constant-time comparison of the presented bearer against the session's token; never throws on length. */
+function bearerMatches(header: string | undefined, expected: string): boolean {
+  const match = /^Bearer\s+(.+)$/i.exec(header ?? '')
+  if (!match) return false
+  const presented = Buffer.from(match[1].trim(), 'utf-8')
+  const wanted = Buffer.from(expected, 'utf-8')
+  if (presented.length !== wanted.length) {
+    // Still burn a comparison so a length mismatch is not measurably faster.
+    timingSafeEqual(wanted, wanted)
+    return false
+  }
+  return timingSafeEqual(presented, wanted)
+}
+
+export function createControlServer(manager: ControlManager, bodyTimeoutMs = 10_000): http.Server {
+  return http.createServer((req, res) => {
+    handleRequest(req, res, manager, bodyTimeoutMs).catch((err) => {
       log.error({ err }, '[control] unhandled request error')
-      sendJson(res, 500, { error: 'internal error' })
+      if (!res.headersSent) sendJson(res, 500, { error: 'internal error' })
     })
   })
+}
 
+export function startControlServer(manager: ControlManager, port: number): void {
+  const server = createControlServer(manager)
   server.listen(port, () => log.info('[control] listening on port %d', port))
 }
 
 async function handleRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  manager: SessionManager,
+  manager: ControlManager,
+  bodyTimeoutMs: number,
 ): Promise<void> {
   applyCors(res)
 
@@ -45,12 +85,25 @@ async function handleRequest(
   }
 
   if (req.method === 'GET' && url === '/sessions') {
-    sendJson(res, 200, { sessions: manager.list() })
+    // A count only: the ids are the handles a caller would need to act on another tenant.
+    sendJson(res, 200, { count: manager.count() })
     return
   }
 
   if (req.method === 'POST' && url === '/sessions') {
-    const body = await readBody(req)
+    let body: string
+    try {
+      body = await readBodyLimited(req, 4096, bodyTimeoutMs)
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        sendJsonAndClose(req, res, 413, { error: 'request body too large' })
+      } else if (err instanceof RequestTimeoutError) {
+        sendJsonAndClose(req, res, 408, { error: 'request timed out' })
+      } else {
+        log.warn({ err }, '[control] request body read failed')
+      }
+      return
+    }
     let code: string | undefined
     try {
       code = body ? (JSON.parse(body).code as string) : undefined
@@ -76,7 +129,30 @@ async function handleRequest(
 
   const deleteMatch = url.match(/^\/sessions\/([^/]+)$/)
   if (req.method === 'DELETE' && deleteMatch) {
-    await manager.stop(decodeURIComponent(deleteMatch[1]))
+    let sessionId: string
+    try {
+      sessionId = decodeURIComponent(deleteMatch[1])
+    } catch {
+      sendJson(res, 400, { error: 'invalid session id' })
+      return
+    }
+    if (!isSafeSessionId(sessionId)) {
+      sendJson(res, 400, { error: 'invalid session id' })
+      return
+    }
+    if (!manager.isLive(sessionId)) {
+      // Not live here: nothing is stopped or deleted, so this is idempotent.
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    const token = manager.tokenFor(sessionId)
+    // A live session that never registered a token is revoked exactly as before tokens existed.
+    if (token !== undefined && !bearerMatches(req.headers.authorization, token)) {
+      log.warn({ sessionId }, '[control] DELETE refused: bearer does not match the session token')
+      sendJson(res, 401, { error: 'unauthorized' })
+      return
+    }
+    await manager.stop(sessionId)
     sendJson(res, 200, { ok: true })
     return
   }
@@ -86,21 +162,19 @@ async function handleRequest(
 
 function applyCors(res: http.ServerResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+  // Only the browser's hosted pairing (POST /sessions) is called cross-origin; DELETE is server-to-server.
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+}
+
+/** Deliver the response first, then drop the connection so the unread body is not left streaming in. */
+function sendJsonAndClose(req: http.IncomingMessage, res: http.ServerResponse, status: number, body: unknown): void {
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(status, { 'Content-Type': 'application/json', Connection: 'close' })
+  res.end(JSON.stringify(body), () => req.destroy())
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
-}
-
-function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
-    let data = ''
-    req.on('data', (chunk) => {
-      data += chunk
-    })
-    req.on('end', () => resolve(data))
-  })
 }

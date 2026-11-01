@@ -14,6 +14,8 @@ import makeWASocket, {
 import * as fs from 'fs'
 import * as path from 'path'
 import pino, { Logger } from 'pino'
+import { isIgnorableJid } from './guards'
+import { fetchPublicImage } from './safeImage'
 
 export interface InboundMessage {
   from: string
@@ -763,6 +765,12 @@ export class WaSession {
         const from = msg.key.remoteJid ?? ''
         if (!from) continue
 
+        // Status posts, broadcast lists and channels are not conversations; never answer them.
+        if (isIgnorableJid(from)) {
+          this.log.debug({ from }, '[in] ignoring broadcast/status/newsletter')
+          continue
+        }
+
         // Baileys fills this from the stanza's addressing context, so for a LID-migrated contact
         // the phone number is right here — see Utils/decode-wa-message.
         const fromAlt = msg.key.remoteJidAlt ?? ''
@@ -1012,18 +1020,20 @@ export class WaSession {
   /**
    * Sends a picture, with its description as the caption.
    *
-   * Baileys is handed the URL rather than the bytes and fetches it itself — which is why a photo
-   * never has to cross the hub, where SignalR's receive limit lives. It also means the fetch happens
-   * from wherever this connector runs, so the address has to be reachable from here; upstream only
-   * ever sends public HTTP addresses for that reason.
+   * The URL is downloaded here, by fetchPublicImage, and Baileys is handed the bytes. Baileys would
+   * fetch any URL (or read any file path) it is given, so an attacker-influenced address must never
+   * reach it. A photo still never crosses the hub, where SignalR's receive limit lives. A rejected or
+   * failed download throws, exactly as a failed Baileys fetch did, and the caller handles it the same way.
    */
   async sendImageMessage(to: string, imageUrl: string, caption: string): Promise<string> {
     if (!this.socket) throw new Error('WhatsApp socket is not connected')
 
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
 
+    const { buffer } = await fetchPublicImage(imageUrl)
+
     const result = await this.socket.sendMessage(jid, {
-      image: { url: imageUrl },
+      image: buffer,
       // Omitted rather than sent empty: an empty caption still gives the bubble a text area on some
       // clients, which reads as a message that failed to load.
       ...(caption ? { caption } : {}),

@@ -1,142 +1,97 @@
-# QLAR Connector
+# Qlar WhatsApp Connector
 
-A small WhatsApp connector that runs **on your own machine**. It bridges WhatsApp
-(via [Baileys](https://github.com/WhiskeySockets/Baileys)) to **Messenger-BE** over a
-SignalR connection, so a Pusaka agent can send and receive WhatsApp messages through
-your phone number.
+Connect one WhatsApp number to a Qlar agent from your own machine, so the WhatsApp session runs on
+your own network and IP address.
 
-```
-WhatsApp  ◀──Baileys──▶  Connector (this app)  ◀──SignalR──▶  Messenger-BE  ◀──▶  Pusaka
-```
+The connector runs next to you and links your number through WhatsApp's "Linked devices". Every
+connection it makes is **outbound** (HTTPS and WebSocket to Qlar and to WhatsApp). It listens on no
+port, so it needs no firewall rule, certificate or DNS entry.
 
----
+- **One number per connector.** One container, or one state directory, holds one number. To link
+  another number, run a second container or use another state directory.
+- **The link survives restarts.** The paired session is stored in the state volume or directory.
+  After a restart the connector reconnects by itself and you do not scan again.
+- **Keep it running.** Stopping the connector disconnects the number from your agent until you
+  start it again.
 
-## Quick start
+## Requirements
 
-**Prerequisites:** Node.js 20+, and a one-time **pairing code** from CMS-Web
-(*Connect WhatsApp* on your agent — valid 10 minutes).
+- Docker, or Node.js 24 or newer
+- Outbound HTTPS to the Qlar address shown in the CMS, and to WhatsApp
+- The phone with the WhatsApp number, with an internet connection, to scan one QR code
 
-```powershell
-npm install   # once
-```
+## Install and connect
 
-**1. First run — pair this machine** (needs `--code`):
+The Qlar CMS (agent -> Channels -> WhatsApp -> Private) prints these lines with your own address and
+a one-time code that expires after 10 minutes. Paste them as shown; the CMS then waits for the
+connector and shows the QR code to scan.
 
-```powershell
-npx ts-node-dev --transpile-only src/index.ts --hub https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector --code <PAIRING_CODE>
-```
+**Docker**
 
-A **QR code** then appears in CMS-Web — scan it with WhatsApp (*Linked devices → Link a device*).
-
-**2. Later runs — reconnect** (no code, no hub needed — both are saved in `session.json`):
-
-```powershell
-npx ts-node-dev --transpile-only src/index.ts
-```
-
-That covers normal use. Everything below is detail and reference.
-
----
-
-## Which `--hub` URL?
-
-`--hub` is the Messenger-BE SignalR hub URL. Pick it by environment:
-
-| Environment | `--hub` value | TLS bypass needed? |
-|---|---|---|
-| **DEV** | `https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector` | No (valid cert) |
-| **Local** | `https://localhost:7193/hubs/connector` | Yes — prefix `$env:NODE_TLS_REJECT_UNAUTHORIZED=0;` |
-
-Local example (Messenger-BE running on your machine):
-
-```powershell
-$env:NODE_TLS_REJECT_UNAUTHORIZED=0; npx ts-node-dev --transpile-only src/index.ts --hub https://localhost:7193/hubs/connector --code <PAIRING_CODE>
+```bash
+docker run -d --name qlar-connector --restart unless-stopped -e QLAR_HUB_URL=<address from the CMS> -e QLAR_PAIRING_CODE=<code from the CMS> -v qlar-connector-state:/state ghcr.io/qlar-ai/qlar-connector:<version> enroll
+docker logs -f qlar-connector
 ```
 
-> **DEV uses the direct App Service URL, not `api-dev.pusaka.ai`.** The API gateway
-> (APIM) only routes the REST `/messenger/api/*` endpoints — not the SignalR hub — so
-> `https://api-dev.pusaka.ai/messenger/hubs/connector` returns `404` until a WebSocket
-> route is added to APIM. Note there is **no `/messenger` prefix** on the App Service URL.
+**Node.js**
 
----
-
-## First run vs. reconnect
-
-**First run (pairing)** — `--code` required:
-1. The connector pairs with Messenger-BE and saves the session to `session.json`.
-2. A **QR code** appears in **CMS-Web** — scan it with WhatsApp (*Linked devices → Link a device*).
-3. WhatsApp credentials are stored in the `wa_session/` folder.
-
-**Reconnect** — `--code` omitted:
-- Reads `sessionId` + `agentId` from `session.json` and reuses `wa_session/` — no QR, no code.
-- `--hub` is also optional (the URL is saved in `session.json`), so running with **no arguments** reconnects to the last hub used.
-
----
-
-## Starting fresh / re-pairing
-
-To link a **different** phone number, or if the session is broken / logged out, delete
-**both** of the connector's persisted files — they are the **only** two it creates:
-
-```powershell
-Remove-Item -Recurse -Force wa_session, session.json
+```bash
+curl -L -o qlar-connector.cjs https://github.com/qlar-ai/qlar-baileys-connector/releases/download/v<version>/qlar-connector.cjs
+node qlar-connector.cjs version
+node qlar-connector.cjs enroll --hub <address from the CMS> --code <code from the CMS>
 ```
 
-Then run the **first-run** command again with a fresh `--code` from CMS-Web.
+Then, on the phone: WhatsApp -> Linked devices -> Link a device, and scan the QR code shown in the
+CMS.
 
-Deleting only one leaves you half-reset:
-- Remove `session.json` only → re-pairs with a new `--code`, but reuses the old WhatsApp login (no new QR).
-- Remove `wa_session/` only → keeps the existing pairing, but Baileys generates a new QR to scan.
+## Commands
 
----
-
-## Why `NODE_TLS_REJECT_UNAUTHORIZED=0`?
-
-Local Messenger-BE runs on HTTPS with a **self-signed dev certificate**. Setting
-`NODE_TLS_REJECT_UNAUTHORIZED=0` tells Node to skip TLS certificate validation so the
-SignalR connection can be established.
-
-⚠️ **Local dev only.** It disables TLS verification for the whole process. Against
-DEV / production (`*.azurewebsites.net` and other properly-certificated hosts),
-**drop it**.
-
----
-
-## Environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MESSENGER_BE_HUB_URL` | – | Alternative to `--hub`; the hub URL to connect to. |
-| `NODE_TLS_REJECT_UNAUTHORIZED` | `1` | Set to `0` for local self-signed hub certs (dev only). |
-| `WA_LOG_LEVEL` | `debug` | Connector's own log verbosity: `trace`/`debug`/`info`/`warn`/`error`. |
-| `BAILEYS_LOG_LEVEL` | `silent` | Set to `debug`/`trace` to see raw WhatsApp protocol traffic. |
-| `WA_DEBUG_PROBE` | – | Set to `1` to verify a number exists on WhatsApp before each send. |
-
----
-
-## npm scripts
-
-| Command | Description |
+| Command | What it does |
 |---|---|
-| `npm run dev` | Run in watch mode with `ts-node-dev` (pass args after `--`). |
-| `npm run build` | Compile TypeScript to `dist/`. |
-| `npm run build:exe` | Build standalone executables into `bin/` (Windows/Linux/macOS). |
+| `enroll` | Links this machine to your agent with the pairing code, then keeps running. Safe to run again: if a number is already linked here, the code is ignored and the stored session reconnects. |
+| `run` | Reconnects the number that is already linked. Use it after a restart if you did not start the connector with `enroll`. |
+| `version` | Prints the connector version. |
 
-Equivalent run via the `dev` script:
+Settings can be flags or environment variables; a flag wins.
 
-```powershell
-npm run dev -- --hub https://wap-pusaka-messenger-dev.azurewebsites.net/hubs/connector --code <PAIRING_CODE>
+| Flag | Environment variable | Meaning |
+|---|---|---|
+| `--hub` | `QLAR_HUB_URL` | The Qlar address shown in the CMS. |
+| `--code` | `QLAR_PAIRING_CODE` | The one-time pairing code. Only needed to link a number. |
+| `--state-dir` | `CONNECTOR_DATA_DIR` | Where the paired session is stored. Docker: `/state`. Node.js: `./state`. |
+
+## After a restart
+
+- Docker: the container restarts by itself (`--restart unless-stopped`). To start it by hand:
+  `docker start qlar-connector`.
+- Node.js: run `node qlar-connector.cjs run --hub <address>` from the folder you installed it in. You
+  do not need a new code.
+
+## Upgrading
+
+Docker: stop and remove the container (`docker rm -f qlar-connector`), then run the install line
+again with the new `<version>`. The `qlar-connector-state` volume keeps your linked number.
+Node.js: download the new `qlar-connector.cjs` over the old one and start it again with `run`.
+
+## Linking a different number
+
+Remove the old link first (in the CMS, or on the phone under Linked devices), then either use a new
+state volume or directory, or delete the old one. A state directory that already holds a number
+ignores a new pairing code.
+
+## Verifying a download
+
+Each release publishes `qlar-connector.sha256` next to `qlar-connector.cjs`:
+
+```bash
+sha256sum -c qlar-connector.sha256
 ```
 
----
+## Troubleshooting
 
-## Files this app creates (not committed)
-
-| Path | Contents |
+| You see | Do this |
 |---|---|
-| `session.json` | Pairing session: `sessionId`, `agentId`, `hubUrl`. |
-| `wa_session/` | WhatsApp auth state / credentials from Baileys. |
-
-These are the **only** files the connector persists, and both are **sensitive** —
-they're already in `.gitignore`; do not commit them. To wipe them, see
-[Starting fresh / re-pairing](#starting-fresh--re-pairing).
+| `The pairing code is invalid or has expired` | Create a new code in the CMS and run the new command. With Docker, remove the old container first (`docker rm -f qlar-connector`), or the name is already taken. The container stays up and prints this message instead of restarting in a loop. |
+| `Could not reach the Qlar hub at ...` | Check that this machine can make outbound HTTPS connections to that address. |
+| `Node 24 or newer is required` | Upgrade Node.js, or use the Docker install. |
+| `Nothing is enrolled in this state directory` | You ran `run` before `enroll`, or you are in a different folder or volume. Run `enroll` with a code. |

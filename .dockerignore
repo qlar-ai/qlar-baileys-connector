@@ -7,3 +7,6 @@ session.json
 wa_session
 *.log
 .git
+Dockerfile*
+.github
+docs
