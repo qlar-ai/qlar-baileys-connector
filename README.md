@@ -59,6 +59,27 @@ Settings can be flags or environment variables; a flag wins.
 | `--hub` | `QLAR_HUB_URL` | The Qlar address shown in the CMS. |
 | `--code` | `QLAR_PAIRING_CODE` | The one-time pairing code. Only needed to link a number. |
 | `--state-dir` | `CONNECTOR_DATA_DIR` | Where the paired session is stored. Docker: `/state`. Node.js: `./state`. |
+| | `CONNECTOR_STATE_KEY` | Optional. Encrypts the stored session (see below). |
+
+## Encrypting the stored session
+
+Without `CONNECTOR_STATE_KEY` the WhatsApp session and the connector token are stored unencrypted in
+the state directory, and the connector says so when it starts. To encrypt them, generate a key once
+and keep it somewhere safe:
+
+```bash
+openssl rand -base64 32
+```
+
+Pass it as `-e CONNECTOR_STATE_KEY=<key>` (Docker) or set it in the environment (Node.js). At the
+next start the stored session is encrypted in place; the number stays linked. From then on the key is
+needed every time: without it, or with a different one, the connector leaves the session untouched
+and does not connect it.
+
+- To change the key: set the new one as `CONNECTOR_STATE_KEY` with `CONNECTOR_STATE_KEY_VERSION=v2`,
+  and keep the old one as `CONNECTOR_STATE_KEY_V1` for one start.
+- To go back to unencrypted storage (for example before installing an older version): start once with
+  `CONNECTOR_STATE_MODE=decrypt` and the key, then remove both.
 
 ## After a restart
 

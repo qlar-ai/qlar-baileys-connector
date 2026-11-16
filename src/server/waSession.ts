@@ -1,13 +1,14 @@
 import makeWASocket, {
   areJidsSameUser,
   Browsers,
+  BufferJSON,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
+  initAuthCreds,
   isJidGroup,
   makeCacheableSignalKeyStore,
   proto,
-  useMultiFileAuthState,
   WAMessage,
   WASocket,
 } from '@whiskeysockets/baileys'
@@ -16,6 +17,10 @@ import * as path from 'path'
 import pino, { Logger } from 'pino'
 import { isIgnorableJid } from './guards'
 import { fetchPublicImage } from './safeImage'
+import { useEncryptedMultiFileAuthState } from './encryptedAuthState'
+
+// Lives in sessionState (no Baileys import, so it is testable); re-exported for existing callers.
+export { isLinked } from './sessionState'
 
 export interface InboundMessage {
   from: string
@@ -229,30 +234,6 @@ export interface WaCallbacks {
     messageId: string,
     context: InboundImageContext,
   ) => Promise<string | null>
-}
-
-/**
- * Whether a session directory holds credentials WhatsApp actually linked.
- *
- * The `wa_session` folder alone proves nothing: `WaSession.start` creates it before the first QR
- * is shown, so a pairing nobody ever scanned leaves an empty one behind. What only a completed link
- * writes is `creds.json` carrying `me` — the account WhatsApp accepted this device under.
- *
- * An unreadable `creds.json` counts as linked. Everything that reads this answer goes on to discard
- * the session, and throwing away a real number over a half-written file would cost the customer a
- * re-pair; keeping a dead one costs a retry.
- */
-export function isLinked(sessionDir: string): boolean {
-  const credsPath = path.join(sessionDir, 'wa_session', 'creds.json')
-
-  if (!fs.existsSync(credsPath)) return false
-
-  try {
-    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8')) as { me?: { id?: string } }
-    return Boolean(creds.me?.id)
-  } catch {
-    return true
-  }
 }
 
 /**
@@ -702,7 +683,12 @@ export class WaSession {
   async start(cb: WaCallbacks): Promise<void> {
     fs.mkdirSync(this.waDir, { recursive: true })
 
-    const { state, saveCreds } = await useMultiFileAuthState(this.waDir)
+    // Encrypted at rest when CONNECTOR_STATE_KEY is set; reads either format. Throws (and the session
+    // stays down, files untouched) when the session's files are encrypted with a key we do not have.
+    const { state, saveCreds } = await useEncryptedMultiFileAuthState(path.dirname(this.waDir), {
+      deps: { initAuthCreds, BufferJSON, proto },
+      log: this.log,
+    })
     const { version } = await fetchLatestBaileysVersion()
 
     const socket = makeWASocket({
