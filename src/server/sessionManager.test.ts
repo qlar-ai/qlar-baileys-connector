@@ -199,3 +199,84 @@ test('restore_SelfHostedManager_RestoredSessionIsNotHosted', async () => {
   await manager.restore()
   assert.equal(created[0].opts.hosted, false)
 })
+
+// State at rest: token fields and auth files are encrypted when a state key is configured.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { loadStateKeyring } = require('./stateCrypto') as typeof import('./stateCrypto')
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { readMeta } = require('./sessionState') as typeof import('./sessionState')
+const stateKey = () => require('crypto').randomBytes(32).toString('base64') as string
+
+function rawMeta(dir: string): Record<string, string> {
+  return JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf-8'))
+}
+
+test('restore_WithStateKey_EncryptsLegacyTokensAndAuthFiles_SessionGetsPlaintextToken', async () => {
+  const s = setupWithMeta({ sessionId: 'enc-1', agentId: 'a', hubUrl: 'h', connectorToken: 'tok-legacy' })
+  fs.mkdirSync(path.join(s.dir, 'wa_session'))
+  fs.writeFileSync(path.join(s.dir, 'wa_session', 'creds.json'), '{"me":{"id":"1@s.whatsapp.net"}}')
+  const keyring = loadStateKeyring({ CONNECTOR_STATE_KEY: stateKey() })
+  const manager = new SessionManager('http://localhost/hub', s.dataRoot, true, keyring)
+
+  await manager.restore()
+
+  assert.equal(created[0].opts.connectorToken, 'tok-legacy')
+  assert.match(rawMeta(s.dir).connectorToken, /^qlarenc1:dek:/)
+  assert.match(fs.readFileSync(path.join(s.dir, 'wa_session', 'creds.json'), 'utf-8'), /^qlarenc1:dek:/)
+})
+
+test('restore_WrongStateKey_SessionSkipped_FilesKept_NotWiped', async () => {
+  const s = setupWithMeta({ sessionId: 'enc-2', agentId: 'a', hubUrl: 'h', connectorToken: 'tok-2' })
+  await new SessionManager('http://localhost/hub', s.dataRoot, true, loadStateKeyring({ CONNECTOR_STATE_KEY: stateKey() })).restore()
+  const before = fs.readFileSync(path.join(s.dir, 'meta.json'), 'utf-8')
+  created.length = 0
+
+  const other = new SessionManager('http://localhost/hub', s.dataRoot, true, loadStateKeyring({ CONNECTOR_STATE_KEY: stateKey() }))
+  await other.restore()
+  const noKey = new SessionManager('http://localhost/hub', s.dataRoot, true, loadStateKeyring({}))
+  await noKey.restore()
+
+  assert.equal(created.length, 0)
+  assert.equal(other.count() + noKey.count(), 0)
+  assert.equal(fs.readFileSync(path.join(s.dir, 'meta.json'), 'utf-8'), before)
+  assert.ok(fs.existsSync(path.join(s.dir, 'state.key')))
+})
+
+test('onToken_onPendingToken_WithStateKey_PersistEncrypted', async () => {
+  const s = setupWithMeta({ sessionId: 'enc-3', agentId: 'a', hubUrl: 'h' })
+  const keyring = loadStateKeyring({ CONNECTOR_STATE_KEY: stateKey() })
+  await new SessionManager('http://localhost/hub', s.dataRoot, true, keyring).restore()
+  created[0].handlers.onPendingToken('enc-3', 'tok-pend')
+  assert.match(rawMeta(s.dir).pendingConnectorToken, /^qlarenc1:dek:/)
+  created[0].handlers.onToken('enc-3', 'tok-final')
+  const raw = rawMeta(s.dir)
+  assert.match(raw.connectorToken, /^qlarenc1:dek:/)
+  assert.equal(raw.pendingConnectorToken, undefined)
+  assert.equal(raw.agentId, 'a')
+  assert.equal(readMeta(s.dir, keyring).connectorToken, 'tok-final')
+})
+
+test('register_WithStateKey_WritesEncryptedTokens', async () => {
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sm-pair-enc-'))
+  created.length = 0
+  const keyring = loadStateKeyring({ CONNECTOR_STATE_KEY: stateKey() })
+  const manager = new SessionManager('http://localhost/hub', dataRoot, true, keyring)
+  await manager.startFromCode('CODE1')
+  created[0].handlers.onRegistered({ sessionId: 'paired-enc', agentId: 'a', hubUrl: 'h', connectorToken: 'tok-p' })
+  const dir = path.join(dataRoot, 'paired-enc')
+  assert.match(rawMeta(dir).connectorToken, /^qlarenc1:dek:/)
+  assert.equal(readMeta(dir, keyring).connectorToken, 'tok-p')
+})
+
+test('restore_DecryptMode_TokensBackToPlaintext', async () => {
+  const key = stateKey()
+  const s = setupWithMeta({ sessionId: 'enc-4', agentId: 'a', hubUrl: 'h', connectorToken: 'tok-4' })
+  await new SessionManager('http://localhost/hub', s.dataRoot, true, loadStateKeyring({ CONNECTOR_STATE_KEY: key })).restore()
+  assert.match(rawMeta(s.dir).connectorToken, /^qlarenc1:/)
+  created.length = 0
+  const decrypt = new SessionManager('http://localhost/hub', s.dataRoot, true, loadStateKeyring({ CONNECTOR_STATE_KEY: key, CONNECTOR_STATE_MODE: 'decrypt' }))
+  await decrypt.restore()
+  assert.equal(rawMeta(s.dir).connectorToken, 'tok-4')
+  assert.equal(created[0].opts.connectorToken, 'tok-4')
+  assert.ok(!fs.existsSync(path.join(s.dir, 'state.key')))
+})
