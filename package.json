@@ -1,6 +1,6 @@
 {
   "name": "qlar-connector",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "QLAR WhatsApp connector: runs on your own machine and bridges Baileys to Qlar. One number per state directory, outbound connections only.",
   "main": "dist/selfhosted/main.js",
   "engines": {
