@@ -4,6 +4,8 @@ import pino, { Logger } from 'pino'
 import { ConnectorSession, SessionMeta } from './connectorSession'
 import { isLinked } from './waSession'
 import { resolveSessionDir } from './guards'
+import { prepareSessionState, readMeta, StoredMeta, writeMeta } from './sessionState'
+import { getProcessKeyring, StateKeyring } from './stateCrypto'
 import type { ControlManager } from './controlServer'
 
 /**
@@ -12,7 +14,8 @@ import type { ControlManager } from './controlServer'
  * a new tenant, `restore` brings persisted ones back after a restart, and each
  * tenant's `{ sessionId, agentId, hubUrl, connectorToken? }` is persisted to
  * `<dataRoot>/<sessionId>/meta.json` so restarts don't need a QR rescan.
- * `connectorToken` / `pendingConnectorToken` are absent in meta.json files written before tokens existed.
+ * `connectorToken` / `pendingConnectorToken` are absent in meta.json files written before tokens existed,
+ * and encrypted at rest when a state key is configured (see sessionState / stateCrypto).
  */
 export class SessionManager implements ControlManager {
   private readonly sessions = new Map<string, ConnectorSession>()
@@ -27,6 +30,8 @@ export class SessionManager implements ControlManager {
     private readonly hubUrl: string,
     private readonly dataRoot: string,
     private readonly hosted: boolean = true,
+    /** How state is kept at rest; read from the environment unless given (tests). */
+    private readonly keyring: StateKeyring = getProcessKeyring(),
   ) {
     fs.mkdirSync(this.dataRoot, { recursive: true })
   }
@@ -59,8 +64,8 @@ export class SessionManager implements ControlManager {
       // Thrown back into pair(), so the pairing fails instead of writing outside the data root.
       throw new Error('Refusing to register an unsafe session id')
     }
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf-8')
+    // Token fields are sealed when a state key is configured; undefined fields drop out as before.
+    writeMeta(dir, JSON.parse(JSON.stringify(meta)) as StoredMeta, this.keyring)
 
     const existing = this.sessions.get(meta.sessionId)
     if (existing && existing !== session) {
@@ -97,10 +102,9 @@ export class SessionManager implements ControlManager {
       this.log.warn({ sessionId }, '[manager] refusing to update meta.json: session id does not resolve inside the data root')
       return
     }
-    const metaPath = path.join(dir, 'meta.json')
     try {
-      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
-      fs.writeFileSync(metaPath, JSON.stringify(change(meta), null, 2), 'utf-8')
+      const meta = readMeta(dir, this.keyring) as SessionMeta
+      writeMeta(dir, change(meta) as StoredMeta, this.keyring)
       this.log.info({ sessionId, what }, '[manager] meta.json updated')
     } catch (err) {
       this.log.error({ err, sessionId, what }, '[manager] meta.json update failed')
@@ -166,13 +170,31 @@ export class SessionManager implements ControlManager {
       // this process — duplicate connections for one account make WhatsApp 401.
       if (this.sessions.has(sessionId)) continue
 
-      const metaPath = path.join(this.dataRoot, sessionId, 'meta.json')
+      const sessionDir = path.join(this.dataRoot, sessionId)
+      const metaPath = path.join(sessionDir, 'meta.json')
 
-      // A dir with no meta.json or no linked WhatsApp creds was never fully paired (or was
+      if (!fs.existsSync(metaPath)) {
+        this.wipe(sessionId)
+        this.log.warn({ sessionId }, '[manager] incomplete session on disk (no meta.json) — wiped, not restored')
+        continue
+      }
+
+      // Bring the files in line with the state key before anything reads them: encrypt plaintext
+      // ones (or decrypt, in rollback mode). A session whose files do not open with the configured
+      // key is skipped and left exactly as it is — never wiped, it is a customer's linked number.
+      try {
+        const prepared = await prepareSessionState(sessionDir, this.keyring, this.log)
+        if (!prepared.ok) continue
+      } catch (err) {
+        this.log.error({ err, sessionId }, '[manager] could not prepare session state (not restored, files kept for the next boot)')
+        continue
+      }
+
+      // A dir with no linked WhatsApp creds was never fully paired (or was
       // half-wiped). Restoring it would spawn an unwatched QR nobody can scan — drop it.
       // isLinked rather than "wa_session exists": that folder is created before the first QR,
       // so an abandoned pairing leaves an empty one that used to pass this check.
-      if (!fs.existsSync(metaPath) || !isLinked(path.join(this.dataRoot, sessionId))) {
+      if (!isLinked(sessionDir, this.keyring)) {
         this.wipe(sessionId)
         this.log.warn({ sessionId }, '[manager] incomplete session on disk — wiped, not restored')
         continue
@@ -180,7 +202,7 @@ export class SessionManager implements ControlManager {
 
       let session: ConnectorSession | undefined
       try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionMeta
+        const meta = readMeta(sessionDir, this.keyring) as SessionMeta
         const restored: ConnectorSession = new ConnectorSession(
           this.hubUrl,
           this.dataRoot,
