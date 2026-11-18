@@ -116,3 +116,5 @@ sha256sum -c qlar-connector.sha256
 | `Could not reach the Qlar hub at ...` | Check that this machine can make outbound HTTPS connections to that address. |
 | `Node 24 or newer is required` | Upgrade Node.js, or use the Docker install. |
 | `Nothing is enrolled in this state directory` | You ran `run` before `enroll`, or you are in a different folder or volume. Run `enroll` with a code. |
+| `Could not secure the session after pairing` | The Qlar hub could not confirm the connector's key in time. Create a new code in the CMS and enroll again. |
+| `requires a secure reconnect` | The Qlar hub no longer accepts this connector version. Upgrade to the latest release (see Upgrading); if the message stays after the upgrade, link the number again (see Linking a different number). |
