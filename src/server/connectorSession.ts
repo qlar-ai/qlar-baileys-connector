@@ -4,7 +4,7 @@ import pino, { Logger } from 'pino'
 import { DisconnectReason } from '@whiskeysockets/baileys'
 import { decideReconnect } from './reconnectPolicy'
 import { InboundImageContext, isLinked, WaSession } from './waSession'
-import { afterHandshake, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
+import { afterHandshake, newConnectorToken, nextTokenToPresent, registerWithHub, secureAfterPair } from './hubHandshake'
 import { resolveSessionDir } from './guards'
 import { HubGate } from './hubGate'
 import { retryUntil } from './retry'
@@ -135,7 +135,8 @@ export class ConnectorSession {
   private connectorToken: string | undefined
   // Generated and presented but not yet confirmed by the hub; never used as a credential here.
   private pendingToken: string | undefined
-  // Set when the hub rejected our token: the session stays idle (no retry, no WhatsApp) until re-paired.
+  // Set when the hub rejected our token, or refused this session as needing a secure reconnect: the
+  // session stays idle (no retry, no WhatsApp) until it is re-paired or the connector is updated.
   private blocked = false
   // Set by stop(): ends any retry loop and keeps a late-finishing attempt from starting WhatsApp.
   private cancelled = false
@@ -179,8 +180,9 @@ export class ConnectorSession {
 
   /**
    * Re-register with the hub, presenting this session's token (or a freshly generated one, which is
-   * persisted once the hub accepts it). Returns false when the hub rejected the token: the session
-   * is then blocked and torn down to idle - never retried, so a mismatch cannot loop against the hub.
+   * persisted once the hub accepts it). Returns false when the hub rejected the token, or answered
+   * that the session requires a secure reconnect: the session is then blocked and torn down to idle -
+   * never retried, so a final answer cannot loop against the hub.
    */
   private async handshake(connection: signalR.HubConnection): Promise<boolean> {
     if (!this.sessionId) return false
@@ -196,6 +198,17 @@ export class ConnectorSession {
     if (result === 'rejected') {
       if (!this.blocked) {
         this.log.error('[hub] connector token rejected - session left idle until it is paired again')
+      }
+      this.blocked = true
+      await this.stop()
+      return false
+    }
+    if (result === 'secure-required') {
+      if (!this.blocked) {
+        this.log.error(
+          '[hub] Messenger-BE refused this session: it requires a secure reconnect - session left idle. ' +
+            'Update the connector to the latest release; if this persists after the update, pair the number again.',
+        )
       }
       this.blocked = true
       await this.stop()
@@ -463,7 +476,8 @@ export class ConnectorSession {
           await this.stop()
           return
         }
-        // undefined: cancelled / superseded. false: token rejected (handshake already blocked and stopped it).
+        // undefined: cancelled / superseded. false: token rejected or secure reconnect required
+        // (handshake already blocked and stopped it).
         if (!registered) return
 
         // Re-declared on every reconnect, not just at startup. Messenger-BE drops the
@@ -556,7 +570,10 @@ export class ConnectorSession {
     await first
   }
 
-  /** One attempt to bring a restored session up. Throws on any failure; a rejected token is not one. */
+  /**
+   * One attempt to bring a restored session up. Throws on any failure; a rejected token or a
+   * "requires a secure reconnect" answer is not one (the session is blocked and idle).
+   */
   private async connectRestored(): Promise<void> {
     const connection = this.buildConnection()
     await connection.start()
@@ -932,12 +949,24 @@ export class ConnectorSession {
     this.sessionId = result.sessionId
     this.agentId = result.agentId
 
-    // Secure the session on this same connection with a token of our own. Only a successful step
-    // yields a token to persist; an old Messenger-BE or a transient failure leaves the session
-    // unsecured (exactly as before tokens), and only an explicit rejection stops the pairing.
-    // On a transient failure the server may have stored the token anyway (a lost reply), so it is kept
-    // as pending and re-presented at the next handshake instead of a new one.
-    const secured = await secureAfterPair(this.connection, this.sessionId)
+    // Secure the session on this same connection with a token of our own, BEFORE the gate opens: a
+    // Messenger-BE that enforces tokens refuses every event (QrGenerated, Connected, ...) from a
+    // connection that has not completed ReconnectSecure, so continuing unsecured would leave the
+    // pairing wizard waiting for a QR that never arrives. A transient failure ("temporarily
+    // unavailable", a timeout) is retried with the same token on this connection - Pair's
+    // registration survives a refused attempt, and the server may already hold the token (lost reply).
+    // The token is kept as pending first, so a transport reconnect meanwhile presents the same one.
+    // Only an old Messenger-BE without ReconnectSecure continues unsecured, exactly as before tokens.
+    const connection = this.connection
+    const token = newConnectorToken()
+    this.pendingToken = token
+    const secured = await secureAfterPair(connection, this.sessionId, {
+      token,
+      isCancelled: () =>
+        this.cancelled || connection !== this.connection || connection.state !== signalR.HubConnectionState.Connected,
+      onRetry: (err, attempt) =>
+        this.log.warn({ err, attempt }, '[hub] securing the session after pairing failed - retrying with the same token'),
+    })
     if (secured.outcome === 'rejected') {
       if (!this.blocked) {
         this.log.error({ sessionId: this.sessionId }, '[hub] connector token rejected right after pairing - not starting WhatsApp')
@@ -946,14 +975,33 @@ export class ConnectorSession {
       // Thrown so the pairing request reports failure and the manager discards this session; nothing retries.
       throw new Error('Connector token rejected after pairing')
     }
-    // Pair itself registered this connection; a failed secure step does not unregister it.
+    if (secured.outcome === 'secure-required') {
+      if (!this.blocked) {
+        this.log.error(
+          { sessionId: this.sessionId },
+          '[hub] Messenger-BE requires a secure reconnect and refused it right after pairing - not starting WhatsApp. Update the connector to the latest release and pair again.',
+        )
+      }
+      this.blocked = true
+      throw new Error('Messenger-BE requires a secure reconnect: update the connector and pair again')
+    }
+    if (secured.outcome === 'failed') {
+      // Not opened unsecured: with tokens enforced its events would be refused. The pairing fails so the
+      // person retries it; the manager discards this session.
+      this.log.error(
+        { err: secured.error, attempts: secured.attempts, sessionId: this.sessionId },
+        '[hub] could not secure the session after pairing - pairing failed, try again with a new code',
+      )
+      throw new Error('Could not secure the session after pairing. Try again with a new pairing code.')
+    }
+    // Pair registered this connection and ReconnectSecure completed (or the server predates it).
     this.gate.open()
     if (secured.outcome === 'secured') {
       this.connectorToken = secured.token
-    } else if (secured.reason === 'error') {
-      this.pendingToken = secured.token
-      this.log.warn({ err: secured.error }, '[hub] securing the session after pairing failed - continuing unsecured')
+      this.pendingToken = undefined
     } else {
+      // An old server stored nothing: no pending token, exactly as before.
+      this.pendingToken = undefined
       this.log.info('[hub] Messenger-BE predates connector tokens - session left unsecured')
     }
 

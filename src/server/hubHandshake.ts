@@ -8,17 +8,37 @@ import { randomBytes } from 'crypto'
  * it, and SignalR then answers "Method does not exist" - the connector falls back to the legacy
  * `Reconnect(sessionId)` so it keeps working exactly as before. A server that knows the session's
  * token and is shown a different one answers "Connector token rejected."; that is final, and is
- * returned rather than thrown so the caller can stop instead of retrying.
+ * returned rather than thrown so the caller can stop instead of retrying. A server that enforces tokens
+ * (Messenger-BE `SecurityFase3:RequireConnectorToken`) answers a token-less registration with "This
+ * session requires a secure reconnect. Update the connector."; that is final too.
  *
  * Kept free of SignalR and Baileys so the decision is unit-testable.
  */
 
 /**
- * 'secured'  - the server accepted (or first-registered) the token: the session is protected.
- * 'legacy'   - an old server without ReconnectSecure; registered through Reconnect, token never seen.
- * 'rejected' - the server holds a different token for this session.
+ * 'secured'         - the server accepted (or first-registered) the token: the session is protected.
+ * 'legacy'          - an old server without ReconnectSecure; registered through Reconnect, token never seen.
+ * 'rejected'        - the server holds a different token for this session.
+ * 'secure-required' - the server refuses token-less connectors for this session (enforce mode, or a
+ *                     secured session met by the legacy Reconnect).
  */
-export type HandshakeResult = 'secured' | 'legacy' | 'rejected'
+export type HandshakeResult = 'secured' | 'legacy' | 'rejected' | 'secure-required'
+
+/** How a hub refusal is classified. Only 'transient' is worth another attempt with the same token. */
+export type HubRefusal = 'rejected' | 'secure-required' | 'old-server' | 'transient'
+
+/** Messenger-BE's refusal of a token-less connector: "This session requires a secure reconnect. Update the connector." */
+export function isSecureReconnectRequired(err: unknown): boolean {
+  return /requires a secure reconnect/i.test(errorMessage(err))
+}
+
+export function classifyHubError(err: unknown): HubRefusal {
+  const msg = errorMessage(err)
+  if (/token rejected/i.test(msg)) return 'rejected'
+  if (isSecureReconnectRequired(err)) return 'secure-required'
+  if (/method does not exist/i.test(msg)) return 'old-server'
+  return 'transient'
+}
 
 /**
  * Whether the presented token must now be persisted: only a freshly generated one that the server
@@ -27,6 +47,10 @@ export type HandshakeResult = 'secured' | 'legacy' | 'rejected'
  */
 export function shouldPersistToken(result: HandshakeResult, wasFresh: boolean): boolean {
   return result === 'secured' && wasFresh
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 /** A fresh connector token: 32 random bytes, base64url (43 characters, no padding). */
@@ -66,10 +90,6 @@ export function afterHandshake(result: HandshakeResult, presentedWasPersisted: b
   return { promote: shouldPersistToken(result, !presentedWasPersisted) }
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
-}
-
 export async function registerWithHub(
   conn: { invoke: (method: string, ...args: unknown[]) => Promise<unknown> },
   sessionId: string,
@@ -79,11 +99,17 @@ export async function registerWithHub(
     await conn.invoke('ReconnectSecure', sessionId, token)
     return 'secured'
   } catch (err) {
-    const msg = errorMessage(err)
-    if (/token rejected/i.test(msg)) return 'rejected'
-    if (/method does not exist/i.test(msg)) {
-      // A Messenger-BE that predates tokens. Any failure of the legacy call propagates as before.
-      await conn.invoke('Reconnect', sessionId)
+    const refusal = classifyHubError(err)
+    if (refusal === 'rejected' || refusal === 'secure-required') return refusal
+    if (refusal === 'old-server') {
+      // A Messenger-BE that predates tokens. Any failure of the legacy call propagates as before,
+      // except a refusal of token-less connectors, which is final like a rejected token.
+      try {
+        await conn.invoke('Reconnect', sessionId)
+      } catch (legacyErr) {
+        if (isSecureReconnectRequired(legacyErr)) return 'secure-required'
+        throw legacyErr
+      }
       return 'legacy'
     }
     throw err
@@ -93,35 +119,72 @@ export async function registerWithHub(
 export type PostPairResult =
   | { outcome: 'secured'; token: string }
   | { outcome: 'unsecured'; reason: 'old-server' }
-  | { outcome: 'unsecured'; reason: 'error'; error: unknown; token: string }
   | { outcome: 'rejected' }
+  | { outcome: 'secure-required' }
+  | { outcome: 'failed'; error: unknown; token: string; attempts: number }
 
 /**
- * Secure a freshly paired session on the same connection that paired it: generate a token and
- * present it through `ReconnectSecure`. The server stores the first token it sees for that
- * connection without looking the account up (it does not exist yet during the wizard).
+ * Delays between attempts of the post-pair secure step: five attempts over about 15 seconds, short
+ * enough for the person waiting on the pairing request.
+ */
+export const SECURE_AFTER_PAIR_DELAYS_MS = [1000, 2000, 4000, 8000]
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Secure a freshly paired session on the same connection that paired it, by presenting a token
+ * through `ReconnectSecure`. The server stores the first token it sees for that connection without
+ * looking the account up (it does not exist yet during the wizard), and only a connection that
+ * completed this step may send events once the server enforces tokens - so the caller must not
+ * open its gate before this succeeds.
+ *
+ * - Accepted: 'secured'.
+ * - A server that predates tokens ("method does not exist"): 'unsecured' / 'old-server'; nothing was
+ *   stored and the session continues unsecured exactly as before tokens.
+ * - "Connector token rejected." or "requires a secure reconnect": final, never retried.
+ * - Anything else (the store was "temporarily unavailable", a timeout) is retried with the SAME token
+ *   on {@link SECURE_AFTER_PAIR_DELAYS_MS}: the server may have stored it already (a lost reply), and
+ *   a different token would then be rejected. The Pair registration of the connection survives a
+ *   refused attempt. When every attempt failed, or `isCancelled` says the connection is no longer
+ *   usable, the result is 'failed' with the token, which the caller keeps as pending.
  *
  * Unlike {@link registerWithHub} there is no fallback to `Reconnect` - that would fail with
- * "account not found" mid-wizard. A server that predates tokens, or any other failure, leaves the
- * session unsecured and working as before; pairing must never fail because this step did.
- * Only an explicit "token rejected" is reported as such.
- *
- * On any other failure the server may still have stored the token (a lost reply), so the token is
- * handed back for the caller to keep as pending and present again at the next handshake. On an old
- * server nothing was stored and no token is returned.
+ * "account not found" mid-wizard.
  */
 export async function secureAfterPair(
   conn: { invoke: (method: string, ...args: unknown[]) => Promise<unknown> },
   sessionId: string,
+  opts: {
+    token?: string
+    delaysMs?: number[]
+    isCancelled?: () => boolean
+    sleep?: (ms: number) => Promise<void>
+    onRetry?: (err: unknown, attempt: number) => void
+  } = {},
 ): Promise<PostPairResult> {
-  const token = newConnectorToken()
-  try {
-    await conn.invoke('ReconnectSecure', sessionId, token)
-    return { outcome: 'secured', token }
-  } catch (err) {
-    const msg = errorMessage(err)
-    if (/token rejected/i.test(msg)) return { outcome: 'rejected' }
-    if (/method does not exist/i.test(msg)) return { outcome: 'unsecured', reason: 'old-server' }
-    return { outcome: 'unsecured', reason: 'error', error: err, token }
+  const token = opts.token || newConnectorToken()
+  const delays = opts.delaysMs ?? SECURE_AFTER_PAIR_DELAYS_MS
+  const sleep = opts.sleep ?? realSleep
+  const isCancelled = opts.isCancelled ?? (() => false)
+
+  let lastError: unknown
+  let attempts = 0
+  for (let n = 1; n <= delays.length + 1; n++) {
+    if (n > 1 && isCancelled()) break
+    attempts = n
+    try {
+      await conn.invoke('ReconnectSecure', sessionId, token)
+      return { outcome: 'secured', token }
+    } catch (err) {
+      const refusal = classifyHubError(err)
+      if (refusal === 'rejected') return { outcome: 'rejected' }
+      if (refusal === 'secure-required') return { outcome: 'secure-required' }
+      if (refusal === 'old-server') return { outcome: 'unsecured', reason: 'old-server' }
+      lastError = err
+    }
+    if (n > delays.length || isCancelled()) break
+    opts.onRetry?.(lastError, n)
+    await sleep(delays[n - 1])
   }
+  return { outcome: 'failed', error: lastError, token, attempts }
 }
